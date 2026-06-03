@@ -140,7 +140,7 @@ docker compose version
         self._ensure_docker_compose()
             
         results.append("Uploading Telemt files...")
-        local_dir = os.path.join(os.path.dirname(__file__), 'protocol_telemt')
+        local_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'protocol_telemt')
         remote_dir = "/opt/amnezia/telemt"
         self.ssh.run_sudo_command(f"mkdir -p {remote_dir}")
         self.ssh.run_sudo_command(f"chmod 755 {remote_dir}")
