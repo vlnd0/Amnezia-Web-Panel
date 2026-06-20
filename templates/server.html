@@ -683,6 +683,37 @@
         </div>
     </div>
 </div>
+
+<!-- AWG ports management -->
+<div class="modal-backdrop" id="awgPortsModal">
+    <div class="modal" style="max-width:560px;">
+        <div class="modal-header">
+            <h2 class="modal-title">Порты AWG</h2>
+            <button class="modal-close" onclick="closeModal('awgPortsModal')">×</button>
+        </div>
+        <input type="hidden" id="awgPortsProto" value="" />
+        <p style="color:var(--text-secondary); font-size:0.9em; margin:var(--space-sm) 0;">
+            <b>Порт для выдачи</b> (★) подставляется в новые конфиги.
+            <b>Принимаемые порты</b> — все, которые ловит сервер; старые оставляй,
+            чтобы уже выданные конфиги продолжали работать. wg слушает один внутренний
+            порт, остальные на него редиректятся.
+        </p>
+        <div id="awgPortsList" style="display:flex; flex-direction:column; gap:6px; margin:var(--space-sm) 0;"></div>
+        <div class="flex gap-sm" style="margin-top:var(--space-sm);">
+            <input type="number" class="form-input" id="awgPortAddInput" placeholder="напр. 8443"
+                min="1" max="65535" style="flex:1;" />
+            <button class="btn btn-secondary btn-sm" onclick="awgPortAdd()">Добавить порт</button>
+        </div>
+        <blockquote style="color:var(--text-secondary); font-size:0.85em; margin-top:var(--space-sm);">
+            ⚠️ Применение пересоздаёт контейнер — несколько секунд обрыва UDP, сессии
+            переустановятся сами. Ключи и клиенты сохраняются.
+        </blockquote>
+        <div class="modal-footer">
+            <button class="btn btn-secondary" onclick="closeModal('awgPortsModal')">Отмена</button>
+            <button class="btn btn-primary" id="awgPortsApplyBtn" onclick="awgPortsApply()">Применить</button>
+        </div>
+    </div>
+</div>
 {% endblock %}
 
 {% block scripts %}
@@ -933,8 +964,12 @@
                     <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')" style="flex:1">${_('uninstall')}</button>
                 `;
             } else {
+                const portsBtn = ['awg', 'awg2', 'awg_legacy'].includes(proto)
+                    ? `<button class="btn btn-secondary btn-sm" onclick="openPortsModal('${proto}')" title="Порты">🔌</button>`
+                    : '';
                 actionsEl.innerHTML = `
                     <button class="btn btn-secondary btn-sm" onclick="selectProtocolForConns('${proto}')" style="flex:1">${_('connections')}</button>
+                    ${portsBtn}
                     <button class="btn btn-danger btn-sm" onclick="uninstallProtocol('${proto}')">${_('uninstall')}</button>
                 `;
                 showConnectionsSection();
@@ -1644,6 +1679,96 @@
             loadConnections();
         }
         updateStatusCounts(liveProtocols);
+    }
+
+    // ========== AWG ports management ==========
+    let awgPortsState = { proto: '', listen: 0, advertised: 0, published: [] };
+
+    function openPortsModal(proto) {
+        const cached = (CACHED_PROTOCOLS && CACHED_PROTOCOLS[proto]) || {};
+        const listen = Number(cached.port) || 0;
+        let published = Array.isArray(cached.published_ports) && cached.published_ports.length
+            ? cached.published_ports.map(Number)
+            : (listen ? [listen] : []);
+        const advertised = Number(cached.advertised_port) || listen || published[0] || 0;
+        // wg listen port must always be present.
+        if (listen && !published.includes(listen)) published.push(listen);
+        published = [...new Set(published)].sort((a, b) => a - b);
+        awgPortsState = { proto, listen, advertised, published };
+        renderAwgPorts();
+        openModal('awgPortsModal');
+    }
+
+    function renderAwgPorts() {
+        const { listen, advertised, published } = awgPortsState;
+        const box = document.getElementById('awgPortsList');
+        box.innerHTML = published.map(p => {
+            const isAdv = p === advertised;
+            const isListen = p === listen;
+            const star = isAdv ? '★' : '☆';
+            const tag = isListen ? ' <span style="color:var(--text-secondary)">(wg)</span>' : '';
+            const removeBtn = isListen
+                ? ''
+                : `<button class="btn btn-danger btn-sm" onclick="awgPortRemove(${p})" title="Убрать">✕</button>`;
+            return `<div class="flex gap-sm" style="align-items:center; justify-content:space-between; padding:4px 8px; border:1px solid var(--border); border-radius:8px;">
+                <span><button class="btn btn-secondary btn-sm" onclick="awgSetAdvertised(${p})" title="Выдавать новым">${star}</button>
+                <b style="margin-left:8px;">${p}</b>${tag}${isAdv ? ' <span style="color:var(--accent)">— выдаётся</span>' : ''}</span>
+                ${removeBtn}
+            </div>`;
+        }).join('');
+    }
+
+    function awgPortAdd() {
+        const input = document.getElementById('awgPortAddInput');
+        const p = parseInt(input.value, 10);
+        if (!p || p < 1 || p > 65535) { showToast('Порт 1..65535', 'error'); return; }
+        if (awgPortsState.published.includes(p)) { showToast('Уже в списке', 'info'); return; }
+        awgPortsState.published.push(p);
+        awgPortsState.published.sort((a, b) => a - b);
+        input.value = '';
+        renderAwgPorts();
+    }
+
+    function awgPortRemove(p) {
+        if (p === awgPortsState.listen) return;
+        awgPortsState.published = awgPortsState.published.filter(x => x !== p);
+        if (awgPortsState.advertised === p) {
+            awgPortsState.advertised = awgPortsState.published[0] || awgPortsState.listen;
+        }
+        renderAwgPorts();
+    }
+
+    function awgSetAdvertised(p) {
+        awgPortsState.advertised = p;
+        renderAwgPorts();
+    }
+
+    async function awgPortsApply() {
+        const { proto, advertised, published } = awgPortsState;
+        if (!advertised || !published.length) { showToast('Нужен порт для выдачи', 'error'); return; }
+        const btn = document.getElementById('awgPortsApplyBtn');
+        btn.disabled = true;
+        const orig = btn.textContent;
+        btn.textContent = 'Применяю…';
+        try {
+            const res = await apiCall(`/api/servers/${SERVER_ID}/awg/ports`, 'POST', {
+                protocol: proto, advertised_port: advertised, published_ports: published,
+            });
+            // Reflect new state in the page cache so it survives until next check.
+            CACHED_PROTOCOLS[proto] = Object.assign({}, CACHED_PROTOCOLS[proto], {
+                advertised_port: res.advertised_port,
+                published_ports: res.published_ports,
+                port: String(res.listen_port),
+            });
+            showToast('Порты обновлены', 'success');
+            closeModal('awgPortsModal');
+            checkServer();
+        } catch (err) {
+            showToast('Ошибка: ' + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            btn.textContent = orig;
+        }
     }
 
     // ========== Init ==========

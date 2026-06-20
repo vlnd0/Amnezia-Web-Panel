@@ -197,6 +197,13 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
+def _client_port(proto_info):
+    """Port to put in new client Endpoints: the advertised port if configured,
+    else the wg listen port. Lets us hand out a new port while older ports
+    (still published + redirected on the server) keep working."""
+    return str(proto_info.get('advertised_port') or proto_info.get('port', '55424'))
+
+
 def generate_vpn_link(config_text):
     b64 = base64.b64encode(config_text.strip().encode('utf-8')).decode('utf-8')
     return f"vpn://{b64}"
@@ -389,7 +396,7 @@ async def perform_mass_operations(delete_uids: List[str] = None, toggle_uids: Li
             # 3. Creates
             for c_req in ops['create']:
                 proto_info = srv.get('protocols', {}).get(c_req['protocol'], {})
-                port = proto_info.get('port', '55424')
+                port = _client_port(proto_info)
                 manager = get_protocol_manager(ssh, c_req['protocol'])
                 
                 if c_req['protocol'] == 'wireguard':
@@ -658,6 +665,12 @@ class Socks5SettingsRequest(BaseModel):
 
 class ProtocolRequest(BaseModel):
     protocol: str = 'awg'
+
+
+class AwgPortsRequest(BaseModel):
+    protocol: str = 'awg2'
+    advertised_port: int           # port handed out in new client configs
+    published_ports: List[int]     # all UDP ports the server accepts (incl. legacy)
 
 
 class AddConnectionRequest(BaseModel):
@@ -1527,6 +1540,11 @@ async def api_check_server(request: Request, server_id: int):
                         }
                         if result.get('clients_count') is not None:
                             record['clients_count'] = result.get('clients_count')
+                        # Preserve panel-managed port config (advertised/published)
+                        # — it isn't reported by the live status probe.
+                        for k in ('advertised_port', 'published_ports'):
+                            if prev.get(k) is not None:
+                                record[k] = prev[k]
                         if record != prev:
                             server['protocols'][proto] = record
                             changed = True
@@ -1816,6 +1834,57 @@ async def api_server_config_save(request: Request, server_id: int, req: ServerCo
         return JSONResponse({'error': str(e)}, status_code=500)
 
 
+@app.post('/api/servers/{server_id}/awg/ports', tags=["Protocols"])
+async def api_awg_ports(request: Request, server_id: int, req: AwgPortsRequest):
+    """Change which UDP ports an AWG server accepts.
+
+    `advertised_port` goes into new client configs; `published_ports` is the
+    full set the server accepts (old ports stay here so existing clients keep
+    working). wg's real ListenPort never moves — extra ports redirect to it.
+    """
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    if req.protocol not in ('awg', 'awg2', 'awg_legacy'):
+        return JSONResponse({'error': 'Port management is AWG-only'}, status_code=400)
+
+    # Validate ports.
+    published = sorted({int(p) for p in req.published_ports})
+    if not all(0 < p < 65536 for p in published):
+        return JSONResponse({'error': 'Ports must be in 1..65535'}, status_code=400)
+    if int(req.advertised_port) not in published:
+        return JSONResponse({'error': 'advertised_port must be one of published_ports'}, status_code=400)
+
+    try:
+        data = load_data()
+        if server_id >= len(data['servers']):
+            return JSONResponse({'error': 'Server not found'}, status_code=404)
+        server = data['servers'][server_id]
+        ssh = get_ssh(server)
+        ssh.connect()
+        mgr = AWGManager(ssh)
+
+        listen_port = mgr._current_listen_port(req.protocol)
+        # The wg ListenPort must always stay published (clients connecting
+        # straight to it keep working).
+        published = sorted(set(published) | {listen_port})
+
+        result = await asyncio.to_thread(
+            mgr.reconfigure_ports, req.protocol, listen_port, published
+        )
+        ssh.disconnect()
+
+        proto_rec = server.setdefault('protocols', {}).setdefault(req.protocol, {})
+        proto_rec['advertised_port'] = int(req.advertised_port)
+        proto_rec['published_ports'] = result['published_ports']
+        proto_rec['port'] = str(listen_port)
+        save_data(data)
+
+        return {'status': 'success', **result, 'advertised_port': int(req.advertised_port)}
+    except Exception as e:
+        logger.exception("Error reconfiguring AWG ports")
+        return JSONResponse({'error': str(e)}, status_code=500)
+
+
 
 
 @app.get('/api/servers/{server_id}/connections', tags=["Connections"])
@@ -1865,7 +1934,7 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
         proto_info = server.get('protocols', {}).get(req.protocol, {})
-        port = proto_info.get('port', '55424')
+        port = _client_port(proto_info)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
@@ -1989,7 +2058,7 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
-        port = proto_info.get('port', '55424')
+        port = _client_port(proto_info)
         ssh = get_ssh(server)
         ssh.connect()
         manager = get_protocol_manager(ssh, req.protocol)
@@ -2129,7 +2198,7 @@ async def api_add_user(request: Request, req: AddUserRequest):
             if req.server_id < len(data['servers']):
                 server = data['servers'][req.server_id]
                 proto_info = server.get('protocols', {}).get(req.protocol, {})
-                port = proto_info.get('port', '55424')
+                port = _client_port(proto_info)
                 conn_name = req.connection_name or f"{req.username}_vpn"
                 ssh = get_ssh(server)
                 ssh.connect()
@@ -2262,7 +2331,7 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][req.server_id]
         proto_info = server.get('protocols', {}).get(req.protocol, {})
-        port = proto_info.get('port', '55424')
+        port = _client_port(proto_info)
         ssh = get_ssh(server)
         await asyncio.to_thread(ssh.connect)
         manager = get_protocol_manager(ssh, req.protocol)
@@ -2443,7 +2512,7 @@ async def api_share_config(token: str, connection_id: str, request: Request):
         sid = conn['server_id']
         server = data['servers'][sid]
         proto_info = server.get('protocols', {}).get(conn['protocol'], {})
-        port = proto_info.get('port', '55424')
+        port = _client_port(proto_info)
         ssh = get_ssh(server)
         ssh.connect()
         # Use appropriate manager for the protocol
@@ -2475,7 +2544,7 @@ async def api_my_connection_config(request: Request, connection_id: str):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][sid]
         proto_info = server.get('protocols', {}).get(conn['protocol'], {})
-        port = proto_info.get('port', '55424')
+        port = _client_port(proto_info)
         ssh = get_ssh(server)
         ssh.connect()
         # Use appropriate manager for the protocol (fixes Telemt/Xray not working for users)

@@ -474,15 +474,35 @@ EOF
         if code != 0:
             raise RuntimeError(f"Failed to configure container: {err}")
 
-    def _build_start_script(self, protocol_type, network):
+    def _build_start_script(self, protocol_type, network, listen_port=None, redirect_ports=None):
         """Render the container start.sh for the given client-address pool.
 
         ``network`` drives the FORWARD/MASQUERADE source so the NAT covers the
         whole pool (a wider /16 instead of the legacy /24).
+
+        ``redirect_ports`` (+ ``listen_port``) bake in-container DNAT so that
+        every published "alternative" UDP port is funnelled to the single wg
+        ListenPort. This is how we advertise a new port to clients while keeping
+        old ports working: wg never moves, the extra ports just redirect to it.
         """
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
         src = str(network)
+
+        redirect_block = ""
+        if listen_port and redirect_ports:
+            lines = [
+                f"iptables -t nat -A PREROUTING -p udp --dport {int(p)} -j REDIRECT --to-ports {int(listen_port)}"
+                for p in redirect_ports
+                if int(p) != int(listen_port)
+            ]
+            if lines:
+                redirect_block = (
+                    "\n# Funnel alternative/legacy public ports to the wg ListenPort\n"
+                    "# (lets new configs use a new port while old ports keep working)\n"
+                    + "\n".join(lines)
+                    + "\n"
+                )
 
         return f"""#!/bin/bash
 echo "Container startup"
@@ -507,7 +527,7 @@ iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
 iptables -t nat -A POSTROUTING -s {src} -o eth0 -j MASQUERADE
 iptables -t nat -A POSTROUTING -s {src} -o eth1 -j MASQUERADE
-
+{redirect_block}
 tail -f /dev/null
 """
 
@@ -538,7 +558,16 @@ tail -f /dev/null
                 f"docker exec -i {container_name} bash -c \"grep -q '{src}' /opt/amnezia/start.sh 2>/dev/null\""
             )
             if code != 0:
-                start_script = self._build_start_script(protocol_type, network)
+                # Preserve any configured port redirects (advertised/legacy
+                # ports) so widening NAT doesn't wipe them out.
+                listen_port = self._current_listen_port(protocol_type)
+                redirect_ports = sorted(
+                    self._current_published_ports(protocol_type) - {listen_port}
+                )
+                start_script = self._build_start_script(
+                    protocol_type, network,
+                    listen_port=listen_port, redirect_ports=redirect_ports,
+                )
                 self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
                 self.ssh.run_sudo_command(
                     f"docker cp /tmp/_amnz_start.sh {container_name}:/opt/amnezia/start.sh"
@@ -575,6 +604,180 @@ tail -f /dev/null
         self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
         self.ssh.run_sudo_command(f"docker rmi {container_name}")
         return True
+
+    # ===================== PORT MANAGEMENT =====================
+
+    def _volume_name(self, protocol_type):
+        """Named volume that persists /opt/amnezia across container recreates."""
+        return f"{self._container_name(protocol_type)}-data"
+
+    def _build_run_cmd(self, protocol_type, published_ports, use_volume=True):
+        """Build the ``docker run`` command (image == locally-built tag).
+
+        ``published_ports`` is the set of UDP host ports to publish; mounting the
+        persistent data volume lets the container be recreated to change the
+        published-port set without losing keys.
+        """
+        container = self._container_name(protocol_type)
+        ports = " ".join(
+            f"-p {int(p)}:{int(p)}/udp"
+            for p in sorted({int(x) for x in published_ports})
+        )
+        vol = f"-v {self._volume_name(protocol_type)}:/opt/amnezia " if use_volume else ""
+        return (
+            f"docker run -d --restart always --privileged "
+            f"--cap-add=NET_ADMIN --cap-add=SYS_MODULE "
+            f"{ports} "
+            f"-v /lib/modules:/lib/modules "
+            f"{vol}"
+            f'--sysctl="net.ipv4.conf.all.src_valid_mark=1" '
+            f"--name {container} {container}"
+        )
+
+    def _current_listen_port(self, protocol_type):
+        """Real wg ListenPort from the server config (fallback: default)."""
+        try:
+            params = self._get_awg_params_from_config(protocol_type)
+            if params.get('port'):
+                return int(params['port'])
+        except Exception:
+            pass
+        return int(AWG_DEFAULTS['port'])
+
+    def _current_published_ports(self, protocol_type):
+        """Set of UDP host ports the container currently publishes."""
+        container = self._container_name(protocol_type)
+        out, _, code = self.ssh.run_sudo_command(f"docker port {container} 2>/dev/null")
+        ports = set()
+        if code == 0:
+            for line in out.splitlines():
+                m = re.match(r'\s*(\d+)/udp', line)
+                if m:
+                    ports.add(int(m.group(1)))
+        return ports
+
+    def _backup_data_dir(self, protocol_type):
+        """Copy /opt/amnezia out of the container to a host temp dir and verify
+        the critical key/config files are present. Runs BEFORE any destructive
+        step, fail-closed: raises (container untouched) if anything is missing,
+        so we never risk losing server keys."""
+        container = self._container_name(protocol_type)
+        host_backup = f"/tmp/amnz_backup_{container}"
+        self.ssh.run_sudo_command(f"rm -rf {host_backup} && mkdir -p {host_backup}")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp {container}:/opt/amnezia/. {host_backup}/"
+        )
+        if code != 0:
+            raise RuntimeError(f"Failed to back up /opt/amnezia: {err or out}")
+
+        cfg = os.path.basename(self._config_path(protocol_type))
+        required = [
+            "awg/wireguard_server_private_key.key",
+            "awg/wireguard_server_public_key.key",
+            f"awg/{cfg}",
+        ]
+        for rel in required:
+            _, _, c = self.ssh.run_sudo_command(f"test -s {host_backup}/{rel}")
+            if c != 0:
+                raise RuntimeError(
+                    f"Backup incomplete (missing {rel}); aborting before any "
+                    f"destructive step — container left untouched."
+                )
+        return host_backup
+
+    def _recreate_container(self, protocol_type, published_ports, listen_port, host_backup):
+        """Recreate the container publishing ``published_ports`` (on the data
+        volume), restore the backed-up /opt/amnezia on top, write a start.sh
+        that redirects every non-listen port to ``listen_port``, and restart."""
+        container = self._container_name(protocol_type)
+
+        self.ssh.run_sudo_command(f"docker rm -f {container} 2>/dev/null")
+        run_cmd = self._build_run_cmd(protocol_type, published_ports, use_volume=True)
+        out, err, code = self.ssh.run_sudo_command(run_cmd)
+        if code != 0:
+            raise RuntimeError(f"docker run failed: {err or out}")
+        self._wait_container_running(container)
+
+        # Restore keys/config/clientsTable on top of the (image-seeded) volume.
+        self.ssh.run_sudo_command(f"docker cp {host_backup}/. {container}:/opt/amnezia/")
+
+        # start.sh: NAT for the (widened) subnet + redirects for alt ports.
+        network = self._get_subnet(protocol_type)
+        redirect_ports = [int(p) for p in published_ports if int(p) != int(listen_port)]
+        start_script = self._build_start_script(
+            protocol_type, network,
+            listen_port=int(listen_port), redirect_ports=redirect_ports,
+        )
+        self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_start.sh {container}:/opt/amnezia/start.sh"
+        )
+        self.ssh.run_sudo_command(f"docker exec {container} chmod +x /opt/amnezia/start.sh")
+        self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
+
+        # Reconnect internal DNS network + restart so restored config & start.sh apply.
+        self.ssh.run_sudo_command(f"docker network connect amnezia-dns-net {container} 2>/dev/null")
+        self.ssh.run_sudo_command(f"docker restart {container}")
+        self._wait_container_running(container)
+
+    def reconfigure_ports(self, protocol_type, listen_port, published_ports):
+        """Change the set of UDP ports the server accepts, keeping wg on
+        ``listen_port`` and redirecting every other published port to it.
+
+        Keys/clients are backed up to the host first (fail-closed) and the data
+        dir is moved onto a persistent volume, so a recreate never loses keys.
+        On failure the previous port set is restored (best-effort rollback).
+        Returns the applied {listen_port, published_ports, redirected}.
+        """
+        if protocol_type not in (self.AWG, self.AWG2, self.AWG_LEGACY):
+            raise RuntimeError(f"Port reconfigure not supported for {protocol_type}")
+
+        listen_port = int(listen_port)
+        target = sorted({int(p) for p in published_ports} | {listen_port})
+        before = sorted(self._current_published_ports(protocol_type) or {listen_port})
+
+        # 1) Back up + verify keys BEFORE touching anything.
+        host_backup = self._backup_data_dir(protocol_type)
+        pubkey_before, _, _ = self.ssh.run_sudo_command(
+            f"cat {host_backup}/awg/wireguard_server_public_key.key"
+        )
+        pubkey_before = pubkey_before.strip()
+
+        # 2) Ensure the persistent data volume exists.
+        self.ssh.run_sudo_command(f"docker volume create {self._volume_name(protocol_type)}")
+
+        # 3) Recreate on the target ports; roll back to the previous set on error.
+        try:
+            self._recreate_container(protocol_type, target, listen_port, host_backup)
+        except Exception as e:
+            logger.exception("Port reconfigure failed, rolling back to %s", before)
+            try:
+                self._recreate_container(protocol_type, before, listen_port, host_backup)
+            except Exception:
+                logger.exception("Rollback ALSO failed; keys safe in %s", host_backup)
+                raise RuntimeError(
+                    f"Reconfigure and rollback both failed. Server keys are safe "
+                    f"in host backup {host_backup} (not deleted) — manual recovery needed."
+                ) from e
+            raise RuntimeError(
+                f"Port reconfigure failed ({e}); rolled back to previous ports {before}."
+            ) from e
+
+        # 4) Verify the server identity survived the recreate.
+        pubkey_after = self._get_server_public_key(protocol_type).strip()
+        if pubkey_after != pubkey_before:
+            raise RuntimeError(
+                f"Server public key changed after reconfigure! Backup kept at "
+                f"{host_backup} on host for recovery."
+            )
+
+        # Success — drop the host backup.
+        self.ssh.run_sudo_command(f"rm -rf {host_backup}")
+        return {
+            "listen_port": listen_port,
+            "published_ports": target,
+            "redirected": [p for p in target if p != listen_port],
+        }
 
     # ===================== CLIENT MANAGEMENT =====================
 
@@ -1067,8 +1270,9 @@ AllowedIPs = {client_ip}/32
 
         # Build client config
         awg_params = self._get_awg_params_from_config(protocol_type)
-        if awg_params.get('port'):
-            port = awg_params['port']
+        # NB: do NOT override `port` with the wg ListenPort here — the caller
+        # passes the *advertised* port (which may be an alternative published
+        # port that redirects to ListenPort). Endpoint must use what was passed.
 
         dns1 = AWG_DEFAULTS['dns1']
         dns2 = AWG_DEFAULTS['dns2']
@@ -1162,8 +1366,9 @@ PersistentKeepalive = 25
             psk = self._get_server_psk(protocol_type)
 
         awg_params = self._get_awg_params_from_config(protocol_type)
-        if awg_params.get('port'):
-            port = awg_params['port']
+        # NB: do NOT override `port` with the wg ListenPort here — the caller
+        # passes the *advertised* port (which may be an alternative published
+        # port that redirects to ListenPort). Endpoint must use what was passed.
 
         dns1 = AWG_DEFAULTS['dns1']
         dns2 = AWG_DEFAULTS['dns2']
