@@ -474,15 +474,17 @@ EOF
         if code != 0:
             raise RuntimeError(f"Failed to configure container: {err}")
 
-    def _upload_start_script(self, protocol_type, port, awg_params):
-        """Upload and execute the start script inside the container."""
-        container_name = self._container_name(protocol_type)
+    def _build_start_script(self, protocol_type, network):
+        """Render the container start.sh for the given client-address pool.
+
+        ``network`` drives the FORWARD/MASQUERADE source so the NAT covers the
+        whole pool (a wider /16 instead of the legacy /24).
+        """
         quick_bin = self._quick_binary(protocol_type)
         config_path = self._config_path(protocol_type)
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
+        src = str(network)
 
-        start_script = f"""#!/bin/bash
+        return f"""#!/bin/bash
 echo "Container startup"
 
 # kill daemons in case of restart
@@ -498,16 +500,62 @@ iptables -A FORWARD -i $IFACE -j ACCEPT
 iptables -A OUTPUT -o $IFACE -j ACCEPT
 
 # Allow forwarding traffic only from the VPN
-iptables -A FORWARD -i $IFACE -o eth0 -s {subnet_ip}/{subnet_cidr} -j ACCEPT
-iptables -A FORWARD -i $IFACE -o eth1 -s {subnet_ip}/{subnet_cidr} -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth0 -s {src} -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth1 -s {src} -j ACCEPT
 
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth0 -j MASQUERADE
-iptables -t nat -A POSTROUTING -s {subnet_ip}/{subnet_cidr} -o eth1 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s {src} -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s {src} -o eth1 -j MASQUERADE
 
 tail -f /dev/null
 """
+
+    def _ensure_subnet_nat(self, protocol_type, network):
+        """Make sure NAT masquerade covers ``network`` on a running container.
+
+        Applied live over SSH (no restart, no session drop) and persisted into
+        start.sh so it survives future restarts. Idempotent — safe to call on
+        every client op. This is what lets already-deployed /24 nodes serve the
+        widened /16 pool without anyone hand-editing iptables on each host: the
+        first client op that needs the wider subnet installs the rule.
+        """
+        container_name = self._container_name(protocol_type)
+        src = str(network)
+        try:
+            # Live, idempotent masquerade for both common egress interfaces.
+            live = " ; ".join(
+                f"iptables -t nat -C POSTROUTING -s {src} -o {iface} -j MASQUERADE 2>/dev/null || "
+                f"iptables -t nat -A POSTROUTING -s {src} -o {iface} -j MASQUERADE"
+                for iface in ("eth0", "eth1")
+            )
+            self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} bash -c '{live}'"
+            )
+
+            # Persist into start.sh only if the subnet isn't already baked in.
+            _, _, code = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} bash -c \"grep -q '{src}' /opt/amnezia/start.sh 2>/dev/null\""
+            )
+            if code != 0:
+                start_script = self._build_start_script(protocol_type, network)
+                self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
+                self.ssh.run_sudo_command(
+                    f"docker cp /tmp/_amnz_start.sh {container_name}:/opt/amnezia/start.sh"
+                )
+                self.ssh.run_sudo_command(
+                    f"docker exec {container_name} chmod +x /opt/amnezia/start.sh"
+                )
+                self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
+        except Exception:
+            # NAT widening is best-effort; don't block client ops if it fails
+            # (legacy /24 clients keep working off the existing rule).
+            logger.exception("Failed to ensure NAT for subnet %s on %s", src, container_name)
+
+    def _upload_start_script(self, protocol_type, port, awg_params):
+        """Upload and execute the start script inside the container."""
+        container_name = self._container_name(protocol_type)
+        start_script = self._build_start_script(protocol_type, self._default_network())
 
         # Upload start script to container via SFTP + docker cp
         self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
@@ -671,13 +719,22 @@ tail -f /dev/null
                     ips.append(match.group(1))
         return ips
 
-    def _get_subnet(self, protocol_type):
-        """Resolve the server's tunnel subnet as an ip_network.
+    def _default_network(self):
+        return ipaddress.ip_network(
+            f"{AWG_DEFAULTS['subnet_address']}/{AWG_DEFAULTS['subnet_cidr']}",
+            strict=False,
+        )
 
-        Derived from the server's own ``Address`` line so allocation always
-        matches the deployed interface/CIDR (existing /24 servers keep working,
-        new servers use the wider default). Falls back to AWG defaults.
+    def _get_subnet(self, protocol_type):
+        """Resolve the client-address pool for this server as an ip_network.
+
+        Anchored on the server's own ``Address`` IP, but widened to at least the
+        default pool prefix so existing /24 nodes can host more than 253 clients
+        *without manual reconfiguration*: allocation uses the wider /16 and
+        ``_ensure_subnet_nat`` extends the masquerade to match. We only ever
+        widen (smaller prefix), never narrow. Falls back to AWG defaults.
         """
+        default_net = self._default_network()
         try:
             config = self._get_server_config(protocol_type)
         except Exception:
@@ -688,15 +745,13 @@ tail -f /dev/null
                 m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', line)
                 if m:
                     try:
+                        prefix = min(int(m.group(2)), default_net.prefixlen)
                         return ipaddress.ip_network(
-                            f"{m.group(1)}/{m.group(2)}", strict=False
+                            f"{m.group(1)}/{prefix}", strict=False
                         )
                     except ValueError:
                         break
-        return ipaddress.ip_network(
-            f"{AWG_DEFAULTS['subnet_address']}/{AWG_DEFAULTS['subnet_cidr']}",
-            strict=False,
-        )
+        return default_net
 
     def _get_next_ip(self, protocol_type, extra_used=None):
         """Allocate the lowest free client IP inside the server's tunnel subnet.
@@ -803,6 +858,10 @@ AllowedIPs = {client_ip}/32
             "Repairing invalid AWG client IP %r -> %s for client %s",
             current_ip, new_ip, client_id,
         )
+
+        # The repaired address typically lands outside the legacy /24, so make
+        # sure the masquerade covers it before the peer goes live.
+        self._ensure_subnet_nat(protocol_type, network)
 
         if rewrite_peer:
             psk = ud.get('psk', '') or self._get_server_psk(protocol_type)
@@ -963,6 +1022,10 @@ AllowedIPs = {client_ip}/32
 
         # Get next available IP
         client_ip = self._get_next_ip(protocol_type)
+
+        # Make sure NAT covers the (possibly widened) pool before handing out an
+        # address that may sit outside the legacy /24.
+        self._ensure_subnet_nat(protocol_type, self._get_subnet(protocol_type))
 
         # Get AWG params from server config
         awg_params = self._get_awg_params_from_config(protocol_type)
