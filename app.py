@@ -1515,12 +1515,20 @@ async def api_check_server(request: Request, server_id: int):
                 else:
                     status['protocols'][proto] = result
                     if result.get('container_exists'):
-                        if proto not in server['protocols']:
-                            server['protocols'][proto] = {
-                                'installed': True,
-                                'port': result.get('port', '55424'),
-                                'awg_params': result.get('awg_params', {})
-                            }
+                        prev = server['protocols'].get(proto, {})
+                        record = {
+                            'installed': True,
+                            'port': result.get('port') or prev.get('port', '55424'),
+                            'awg_params': result.get('awg_params') or prev.get('awg_params', {}),
+                            # Cache running state + client count so the next page
+                            # load can paint the cards accurately before the live
+                            # check returns (see primeFromCache in server.html).
+                            'container_running': bool(result.get('container_running')),
+                        }
+                        if result.get('clients_count') is not None:
+                            record['clients_count'] = result.get('clients_count')
+                        if record != prev:
+                            server['protocols'][proto] = record
                             changed = True
                     else:
                         if proto in server['protocols']:

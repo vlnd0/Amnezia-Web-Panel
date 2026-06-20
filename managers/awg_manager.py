@@ -13,6 +13,7 @@ import os
 import secrets
 import struct
 import hashlib
+import ipaddress
 import logging
 import re
 from base64 import b64encode, b64decode
@@ -25,8 +26,11 @@ logger = logging.getLogger(__name__)
 AWG_DEFAULTS = {
     'port': '55424',
     'mtu': '1280',
-    'subnet_address': '10.8.1.0',
-    'subnet_cidr': '24',
+    # /16 keeps the pool large enough for tens of thousands of clients so the
+    # 4th octet never has to overflow (the old /24 capped at 253 and the
+    # allocator used to emit invalid octets like 10.8.1.324 past that point).
+    'subnet_address': '10.8.0.0',
+    'subnet_cidr': '16',
     'subnet_ip': '10.8.1.1',
     'dns1': '1.1.1.1',
     'dns2': '1.0.0.1',
@@ -667,29 +671,146 @@ tail -f /dev/null
                     ips.append(match.group(1))
         return ips
 
-    def _get_next_ip(self, protocol_type):
-        """Calculate the next available IP for a new client."""
-        used_ips = self._get_used_ips(protocol_type)
-        if not used_ips:
-            base = AWG_DEFAULTS['subnet_address']
-            parts = base.split('.')
-            parts[3] = '2'
-            return '.'.join(parts)
+    def _get_subnet(self, protocol_type):
+        """Resolve the server's tunnel subnet as an ip_network.
 
-        # Get the last used IP and increment
-        last_ip = used_ips[-1]
-        parts = last_ip.split('.')
-        last_octet = int(parts[3])
+        Derived from the server's own ``Address`` line so allocation always
+        matches the deployed interface/CIDR (existing /24 servers keep working,
+        new servers use the wider default). Falls back to AWG defaults.
+        """
+        try:
+            config = self._get_server_config(protocol_type)
+        except Exception:
+            config = ''
+        for line in config.split('\n'):
+            line = line.strip()
+            if line.startswith('Address'):
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', line)
+                if m:
+                    try:
+                        return ipaddress.ip_network(
+                            f"{m.group(1)}/{m.group(2)}", strict=False
+                        )
+                    except ValueError:
+                        break
+        return ipaddress.ip_network(
+            f"{AWG_DEFAULTS['subnet_address']}/{AWG_DEFAULTS['subnet_cidr']}",
+            strict=False,
+        )
 
-        if last_octet == 254:
-            next_octet = last_octet + 3
-        elif last_octet == 255:
-            next_octet = last_octet + 2
-        else:
-            next_octet = last_octet + 1
+    def _get_next_ip(self, protocol_type, extra_used=None):
+        """Allocate the lowest free client IP inside the server's tunnel subnet.
 
-        parts[3] = str(next_octet)
-        return '.'.join(parts)
+        Uses real IP arithmetic (``ipaddress``) so the result is always a valid
+        host inside the subnet — the previous string-increment logic carried
+        nothing into the upper octets and could emit invalid addresses such as
+        ``10.8.1.324`` once the client count passed 254. Freed addresses (gaps
+        left by removed clients) are reused, and an exhausted pool raises
+        loudly instead of producing garbage.
+        """
+        network = self._get_subnet(protocol_type)
+
+        used = set()
+        for ip in self._get_used_ips(protocol_type):
+            try:
+                used.add(ipaddress.ip_address(ip))
+            except ValueError:
+                # Skip malformed/out-of-range leftovers (e.g. 10.8.1.324).
+                continue
+        for ip in (extra_used or []):
+            try:
+                used.add(ipaddress.ip_address(ip))
+            except ValueError:
+                continue
+
+        for host in network.hosts():
+            if host in used:
+                continue
+            return str(host)
+
+        raise RuntimeError(
+            f"AWG subnet {network} is exhausted "
+            f"({len(used)} addresses in use) — widen subnet_cidr to allocate more."
+        )
+
+    def _ip_in_subnet(self, ip_str, network):
+        """True if ``ip_str`` is a valid address that falls inside ``network``."""
+        try:
+            return ipaddress.ip_address(ip_str) in network
+        except ValueError:
+            return False
+
+    def _replace_server_peer(self, protocol_type, client_id, client_ip, psk):
+        """Drop any existing [Peer] for ``client_id`` and append a fresh one, then sync."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._config_path(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+
+        config = self._get_server_config(protocol_type)
+        new_sections = []
+        for section in config.split('['):
+            if not section.strip():
+                continue
+            if client_id in section:
+                continue
+            new_sections.append(section)
+
+        new_config = '[' + '['.join(new_sections)
+        new_config = new_config.rstrip() + f"""
+
+[Peer]
+PublicKey = {client_id}
+PresharedKey = {psk}
+AllowedIPs = {client_ip}/32
+"""
+        self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
+        )
+
+    def _repair_client_ip(self, protocol_type, client, clients_table, rewrite_peer=True):
+        """Ensure ``client`` holds a valid IP inside the current subnet.
+
+        Returns the (possibly newly assigned) client IP. If the stored IP is
+        malformed or outside the server subnet — e.g. legacy ``10.8.1.324`` rows
+        left by the old allocator — a fresh free IP is allocated and persisted
+        to the clients table. When ``rewrite_peer`` is true the server ``[Peer]``
+        AllowedIPs is also rewritten in place; callers that re-add the peer
+        themselves (e.g. enabling a client) pass ``False`` to avoid a duplicate.
+        This lets such clients be re-issued a working config without being
+        recreated (their keys are preserved).
+        """
+        ud = client.setdefault('userData', {})
+        current_ip = ud.get('clientIp', '')
+        network = self._get_subnet(protocol_type)
+        if self._ip_in_subnet(current_ip, network):
+            return current_ip
+
+        client_id = client.get('clientId', '')
+        # Avoid colliding with IPs held by other clients in the table.
+        extra_used = [
+            c.get('userData', {}).get('clientIp', '')
+            for c in clients_table
+            if c is not client and c.get('userData', {}).get('clientIp')
+        ]
+        new_ip = self._get_next_ip(protocol_type, extra_used=extra_used)
+        logger.warning(
+            "Repairing invalid AWG client IP %r -> %s for client %s",
+            current_ip, new_ip, client_id,
+        )
+
+        if rewrite_peer:
+            psk = ud.get('psk', '') or self._get_server_psk(protocol_type)
+            self._replace_server_peer(protocol_type, client_id, new_ip, psk)
+
+        ud['clientIp'] = new_ip
+        self._save_clients_table(protocol_type, clients_table)
+        return new_ip
 
     def _parse_peers_from_config(self, protocol_type):
         """Parse [Peer] sections from WireGuard server config and return dict of pubkey -> {allowedIps}."""
@@ -964,11 +1085,14 @@ PersistentKeepalive = 25
 
         ud = client.get('userData', {})
         client_priv_key = ud.get('clientPrivateKey', '')
-        client_ip = ud.get('clientIp', '')
         psk = ud.get('psk', '')
 
         if not client_priv_key:
             raise RuntimeError("Client private key not stored. Config cannot be reconstructed.")
+
+        # Self-heal legacy invalid IPs (e.g. 10.8.1.324) so the config can be
+        # re-issued without recreating the client.
+        client_ip = self._repair_client_ip(protocol_type, client, clients_table)
 
         server_pub_key = self._get_server_public_key(protocol_type)
         if not psk:
@@ -1056,10 +1180,15 @@ PersistentKeepalive = 25
 
             ud = client.get('userData', {})
             psk = ud.get('psk', '')
-            client_ip = ud.get('clientIp', '')
 
             if not psk:
                 psk = self._get_server_psk(protocol_type)
+
+            # Heal legacy invalid IPs before re-adding the peer (this path
+            # appends the peer itself, so don't let repair rewrite it too).
+            client_ip = self._repair_client_ip(
+                protocol_type, client, clients_table, rewrite_peer=False
+            )
 
             peer_section = f"""
 [Peer]

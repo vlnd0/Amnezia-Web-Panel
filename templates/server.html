@@ -689,6 +689,10 @@
 <script>
     const SERVER_ID = {{ server_id }};
     const SERVER_HOST = "{{ server.host }}";
+    // Last-known protocol state persisted server-side. Used to paint the cards
+    // instantly on load so the page doesn't flash "not installed" while the
+    // live SSH check (checkServer) is still in flight.
+    const CACHED_PROTOCOLS = {{ (server.protocols or {}) | tojson }};
     let currentInstallProto = 'awg';
     let currentConfig = '';
     let currentVpnLink = '';
@@ -1605,7 +1609,45 @@
         }
     }
 
+    // Paint protocol cards from the cached (last-known) state immediately, so
+    // installed protocols don't briefly render as "not installed" while the
+    // live check runs. checkServer() corrects any drift a moment later.
+    function primeFromCache() {
+        if (!CACHED_PROTOCOLS || !Object.keys(CACHED_PROTOCOLS).length) return;
+        const protoSelect = document.getElementById('connProtoSelect');
+        let firstVal = null;
+        const liveProtocols = {};
+        for (const [proto, cached] of Object.entries(CACHED_PROTOCOLS)) {
+            // Cache only records installed protocols; assume running unless we
+            // explicitly stored container_running=false last time.
+            const running = cached.container_running !== false;
+            const info = {
+                container_exists: true,
+                container_running: running,
+                port: cached.port,
+                clients_count: cached.clients_count,
+                awg_params: cached.awg_params,
+            };
+            liveProtocols[proto] = info;
+            updateProtocolCard(proto, info);
+            const isVPN = ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'wireguard'].includes(proto);
+            if (running && isVPN && protoSelect) {
+                const opt = document.createElement('option');
+                opt.value = proto;
+                opt.textContent = getProtoTitle(proto);
+                protoSelect.appendChild(opt);
+                if (!firstVal) firstVal = proto;
+            }
+        }
+        if (firstVal && protoSelect) {
+            protoSelect.value = firstVal;
+            loadConnections();
+        }
+        updateStatusCounts(liveProtocols);
+    }
+
     // ========== Init ==========
+    primeFromCache();
     checkServer();
     loadServerStats();
 </script>
