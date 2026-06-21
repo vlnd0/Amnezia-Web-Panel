@@ -607,6 +607,113 @@ tail -f /dev/null
             # (legacy /24 clients keep working off the existing rule).
             logger.exception("Failed to ensure NAT for subnet %s on %s", src, container_name)
 
+        # NAT covers only the *egress* half. Legacy /24 nodes also need the
+        # tunnel interface's on-link subnet widened to the pool, or the kernel
+        # has no route back to awg0 for replies destined to live-added peers
+        # outside the /24 (added via `wg syncconf`, which writes no route). The
+        # client then connects and uploads but receives nothing. Same per-client
+        # auto-heal trigger as the NAT widening above.
+        self._ensure_tunnel_onlink(protocol_type, network)
+
+    def _server_address(self, protocol_type):
+        """Return ``(ip, prefixlen)`` of the server's [Interface] Address, or
+        ``(None, None)`` if it can't be read/parsed."""
+        try:
+            config = self._get_server_config(protocol_type)
+        except Exception:
+            return None, None
+        for line in config.split('\n'):
+            s = line.strip()
+            if s.startswith('Address'):
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', s)
+                if m:
+                    return m.group(1), int(m.group(2))
+        return None, None
+
+    def _apply_onlink_widen(self, protocol_type, ip_self, cur_prefix, target_prefix, network):
+        """Widen the tunnel interface's on-link subnet from ``ip_self/cur_prefix``
+        to ``ip_self/target_prefix`` — persistently (rewrites the server config so
+        a container restart / ``awg-quick up`` keeps the wide subnet) and live
+        (no restart, no session drop)."""
+        container = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        iface = self._interface_name(protocol_type, config_path)
+        want = f"{ip_self}/{target_prefix}"
+
+        # (a) Persist into the server config. Without this the fix is lost on the
+        #     next restart (awg-quick re-reads the narrow Address), so the live
+        #     swap below would only ever be a temporary patch.
+        config = self._get_server_config(protocol_type)
+        new_config = re.sub(
+            rf"(?m)^([ \t]*Address[ \t]*=[ \t]*){re.escape(ip_self)}/{cur_prefix}\b",
+            rf"\g<1>{want}",
+            config,
+        )
+        if new_config != config:
+            self.ssh.upload_file(new_config, "/tmp/_amnz_onlink.conf")
+            self.ssh.run_sudo_command(
+                f"docker cp /tmp/_amnz_onlink.conf {container}:{config_path}"
+            )
+            self.ssh.run_command("rm -f /tmp/_amnz_onlink.conf")
+
+        # (b) Apply live: add the wide address, CONFIRM it is on the interface,
+        #     only then drop the narrow one. Add-before-del leaves no window
+        #     without an address, and the guard means a failed add never strips
+        #     the only address off the live tunnel.
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container} ip addr add {want} dev {iface}"
+        )
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec -i {container} ip -o -4 addr show dev {iface}"
+        )
+        if want in out:
+            self.ssh.run_sudo_command(
+                f"docker exec -i {container} ip addr del {ip_self}/{cur_prefix} dev {iface}"
+            )
+        logger.warning(
+            "Widened AWG tunnel on-link %s/%s -> %s on %s (%s)",
+            ip_self, cur_prefix, want, container, protocol_type,
+        )
+
+    def _ensure_tunnel_onlink(self, protocol_type, network):
+        """Best-effort per-client auto-heal: widen the tunnel on-link subnet to
+        ``network`` if the interface is still on a narrower prefix. Idempotent;
+        only ever widens (smaller prefix), never narrows."""
+        try:
+            ip_self, cur = self._server_address(protocol_type)
+            if ip_self and cur is not None and cur > network.prefixlen:
+                self._apply_onlink_widen(
+                    protocol_type, ip_self, cur, network.prefixlen, network
+                )
+        except Exception:
+            container = self._container_name(protocol_type)
+            logger.exception(
+                "Failed to widen tunnel on-link on %s (%s)", container, protocol_type
+            )
+
+    def heal_tunnel_onlink(self, protocol_type, apply=True):
+        """Detect (and optionally fix) a too-narrow on-link subnet on the tunnel
+        interface — the maintenance-script entrypoint (explicit reporting).
+
+        Returns a dict::
+
+            {'status': 'noop'|'widen'|'widened'|'unknown',
+             'ip': <server tunnel ip>, 'from': <cur prefix>, 'to': <target prefix>}
+
+        ``apply=False`` only reports (dry-run); ``apply=True`` widens in place."""
+        network = self._get_subnet(protocol_type)
+        ip_self, cur = self._server_address(protocol_type)
+        target = network.prefixlen
+        if not ip_self or cur is None:
+            return {'status': 'unknown'}
+        if cur <= target:
+            return {'status': 'noop', 'ip': ip_self, 'from': cur, 'to': cur}
+        result = {'status': 'widen', 'ip': ip_self, 'from': cur, 'to': target}
+        if apply:
+            self._apply_onlink_widen(protocol_type, ip_self, cur, target, network)
+            result['status'] = 'widened'
+        return result
+
     def _upload_start_script(self, protocol_type, port, awg_params):
         """Upload and execute the start script inside the container."""
         container_name = self._container_name(protocol_type)
