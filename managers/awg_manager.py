@@ -805,6 +805,106 @@ tail -f /dev/null
             "redirected": [p for p in target if p != listen_port],
         }
 
+    # ===================== CONFIG SYNC / PEER HYGIENE =====================
+
+    def _allowed_ips_invalid(self, allowed):
+        """True if any address in an ``AllowedIPs`` value is not parseable
+        (e.g. 10.8.1.257/32 from the old allocator overflow bug)."""
+        for part in allowed.split(','):
+            ip = part.strip().split('/')[0].strip()
+            if not ip:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return True
+        return False
+
+    def _find_invalid_peers(self, config):
+        """List ``(public_key, allowed_ips)`` for peers with an invalid
+        AllowedIPs. A single such peer makes ``wg syncconf`` reject the WHOLE
+        config, so every peer added after it silently never loads into the live
+        interface (client is in the file but times out on connect)."""
+        invalid = []
+        for sec in config.split('['):
+            if not sec.lstrip().startswith('Peer]'):
+                continue
+            m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
+            if m and self._allowed_ips_invalid(m.group(1).strip()):
+                mp = re.search(r'PublicKey\s*=\s*([^\n]+)', sec)
+                invalid.append((mp.group(1).strip() if mp else '', m.group(1).strip()))
+        return invalid
+
+    def _purge_invalid_peers(self, protocol_type):
+        """Drop peers with invalid AllowedIPs from the server config file.
+        Returns the list of dropped ``(public_key, allowed_ips)`` (empty if the
+        config was already clean — then nothing is written)."""
+        config = self._get_server_config(protocol_type)
+        invalid = self._find_invalid_peers(config)
+        if not invalid:
+            return []
+
+        kept = []
+        for sec in config.split('['):
+            if sec.lstrip().startswith('Peer]'):
+                m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
+                if m and self._allowed_ips_invalid(m.group(1).strip()):
+                    continue  # drop this poisoned peer
+            kept.append(sec)
+        new_config = '['.join(kept)
+
+        container = self._container_name(protocol_type)
+        config_path = self._config_path(protocol_type)
+        self.ssh.upload_file(new_config, "/tmp/_amnz_purge.conf")
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_purge.conf {container}:{config_path}")
+        self.ssh.run_command("rm -f /tmp/_amnz_purge.conf")
+        logger.warning(
+            "Purged %d invalid AWG peer(s) from %s config: %s",
+            len(invalid), protocol_type, [a for _, a in invalid],
+        )
+        return invalid
+
+    def _sync_config(self, protocol_type):
+        """Sanitize then push the config into the kernel interface.
+
+        Sanitizing first means one leftover invalid peer can never again block
+        ``syncconf`` (and thus silently break every newly-added client)."""
+        dropped = self._purge_invalid_peers(protocol_type)
+        container = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+        config_path = self._config_path(protocol_type)
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
+        )
+        return dropped
+
+    def _live_peer_count(self, protocol_type):
+        """Number of peers currently loaded in the live wg interface."""
+        container = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec -i {container} bash -c '{wg_bin} show {iface} peers | grep -c .'"
+        )
+        try:
+            return int(out.strip())
+        except (ValueError, AttributeError):
+            return -1
+
+    def cleanup_invalid_peers(self, protocol_type):
+        """Purge invalid-AllowedIPs peers and resync, reviving clients that were
+        stuck (present in the config file but absent from the live interface).
+        Returns a summary dict."""
+        before = self._live_peer_count(protocol_type)
+        dropped = self._sync_config(protocol_type)
+        after = self._live_peer_count(protocol_type)
+        return {
+            "dropped": [{"public_key": k, "allowed_ips": a} for k, a in dropped],
+            "peers_live_before": before,
+            "peers_live_after": after,
+        }
+
     # ===================== CLIENT MANAGEMENT =====================
 
     def _get_clients_table(self, protocol_type):
@@ -1053,9 +1153,7 @@ AllowedIPs = {client_ip}/32
             f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
         )
         self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
-        )
+        self._sync_config(protocol_type)
 
     def _repair_client_ip(self, protocol_type, client, clients_table, rewrite_peer=True):
         """Ensure ``client`` holds a valid IP inside the current subnet.
@@ -1274,9 +1372,7 @@ AllowedIPs = {client_ip}/32
         )
 
         # Sync config without restart
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
-        )
+        self._sync_config(protocol_type)
 
         # Update clients table — store keys for config reconstruction
         clients_table = self._get_clients_table(protocol_type)
@@ -1515,9 +1611,7 @@ AllowedIPs = {client_ip}/32
             self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
 
         # Sync config
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
-        )
+        self._sync_config(protocol_type)
 
         # Update enabled status in clients table
         clients_table = self._get_clients_table(protocol_type)
@@ -1557,9 +1651,7 @@ AllowedIPs = {client_ip}/32
         self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
 
         # Sync config
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
-        )
+        self._sync_config(protocol_type)
 
         # Update clients table
         clients_table = self._get_clients_table(protocol_type)
