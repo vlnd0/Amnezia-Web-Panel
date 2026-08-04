@@ -750,6 +750,18 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
+_NODE_LOCKS = {}
+
+
+def _node_lock(server):
+    """One lock per node — its config file is edited read-modify-write."""
+    key = f"{server.get('host')}:{server.get('ssh_port', 22)}"
+    lock = _NODE_LOCKS.get(key)
+    if lock is None:
+        lock = _NODE_LOCKS[key] = asyncio.Lock()
+    return lock
+
+
 async def _ssh_manager_call(server, protocol, method, *args, **kwargs):
     """Run one manager call over a fresh SSH session in a worker thread.
 
@@ -759,6 +771,13 @@ async def _ssh_manager_call(server, protocol, method, *args, **kwargs):
     touch a server — queues behind it. Under a handful of concurrent API calls
     the panel stops answering entirely. Offloading keeps the loop free; a fresh
     SSHManager per call means nothing is shared across threads.
+
+    Calls are still serialized PER NODE. The managers mutate `awg0.conf` and
+    `clientsTable` read-modify-write over SSH with no locking of their own, so
+    two concurrent `add_client`s on one node would race and silently drop a
+    peer. Until now the blocked event loop serialized everything by accident —
+    taking that away without this lock would trade an outage for data loss.
+    Different nodes still proceed in parallel, which is where the win is.
     """
 
     def _run():
@@ -773,7 +792,8 @@ async def _ssh_manager_call(server, protocol, method, *args, **kwargs):
             except Exception:
                 logger.warning("SSH disconnect failed", exc_info=True)
 
-    return await asyncio.to_thread(_run)
+    async with _node_lock(server):
+        return await asyncio.to_thread(_run)
 
 
 def _client_port(proto_info):
