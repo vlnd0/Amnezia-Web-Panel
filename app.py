@@ -780,20 +780,38 @@ async def _ssh_manager_call(server, protocol, method, *args, **kwargs):
     Different nodes still proceed in parallel, which is where the win is.
     """
 
+    def _run(ssh):
+        manager = get_protocol_manager(ssh, protocol)
+        return _manager_call(manager, method, protocol, *args, **kwargs)
+
+    return await _ssh_session(server, _run, lock=True)
+
+
+async def _ssh_session(server, fn, lock=False):
+    """Run `fn(ssh)` against a connected node, off the event loop.
+
+    Every SSH-touching endpoint needs this, not just the connection ones: a
+    single inline `ssh.connect()` in an `async def` freezes the whole panel for
+    the length of the round-trip. Pass lock=True for anything that MUTATES the
+    node's config (see `_ssh_manager_call`); read-only calls skip the lock so a
+    slow write doesn't stall the dashboard.
+    """
+
     def _run():
         ssh = get_ssh(server)
         ssh.connect()
         try:
-            manager = get_protocol_manager(ssh, protocol)
-            return _manager_call(manager, method, protocol, *args, **kwargs)
+            return fn(ssh)
         finally:
             try:
                 ssh.disconnect()
             except Exception:
                 logger.warning("SSH disconnect failed", exc_info=True)
 
-    async with _node_lock(server):
-        return await asyncio.to_thread(_run)
+    if lock:
+        async with _node_lock(server):
+            return await asyncio.to_thread(_run)
+    return await asyncio.to_thread(_run)
 
 
 def _client_port(proto_info):
@@ -2046,48 +2064,49 @@ async def api_server_stats(request: Request, server_id: int):
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        stats = {}
-        out, _, _ = ssh.run_command(
-            "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
-            "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
-            "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
-        )
-        try:
-            stats['cpu'] = round(float(out.strip().split('\n')[0]), 1)
-        except (ValueError, IndexError):
-            stats['cpu'] = 0
-        out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(ram_used=used, ram_total=total, ram_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(ram_used=0, ram_total=0, ram_percent=0)
-        out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
-        try:
-            parts = out.strip().split()
-            used, total = int(parts[0]), int(parts[1])
-            stats.update(disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0)
-        except (ValueError, IndexError):
-            stats.update(disk_used=0, disk_total=0, disk_percent=0)
-        out, _, _ = ssh.run_command(
-            "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
-            "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
-        )
-        try:
-            parts = out.strip().split()
-            stats['net_rx'], stats['net_tx'] = int(parts[0]), int(parts[1])
-        except (ValueError, IndexError):
-            stats['net_rx'] = stats['net_tx'] = 0
-        out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
-        stats['uptime'] = out.strip()
-        ssh.disconnect()
-        return stats
+        return await _ssh_session(server, lambda ssh: _collect_server_stats(ssh))
     except Exception as e:
         logger.exception("Error getting server stats")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+def _collect_server_stats(ssh):
+    stats = {}
+    out, _, _ = ssh.run_command(
+        "top -bn1 | grep 'Cpu(s)' | awk '{print $2}' | cut -d'%' -f1 2>/dev/null || "
+        "awk '{u=$2+$4; t=$2+$4+$5; if(NR==1){pu=u;pt=t} else printf \"%.1f\", (u-pu)/(t-pt)*100}' "
+        "<(grep 'cpu ' /proc/stat) <(sleep 0.5 && grep 'cpu ' /proc/stat) 2>/dev/null"
+    )
+    try:
+        stats['cpu'] = round(float(out.strip().split('\n')[0]), 1)
+    except (ValueError, IndexError):
+        stats['cpu'] = 0
+    out, _, _ = ssh.run_command("free -b | awk 'NR==2{printf \"%d %d\", $3, $2}'")
+    try:
+        parts = out.strip().split()
+        used, total = int(parts[0]), int(parts[1])
+        stats.update(ram_used=used, ram_total=total, ram_percent=round(used / total * 100, 1) if total > 0 else 0)
+    except (ValueError, IndexError):
+        stats.update(ram_used=0, ram_total=0, ram_percent=0)
+    out, _, _ = ssh.run_command("df -B1 / | awk 'NR==2{printf \"%d %d\", $3, $2}'")
+    try:
+        parts = out.strip().split()
+        used, total = int(parts[0]), int(parts[1])
+        stats.update(disk_used=used, disk_total=total, disk_percent=round(used / total * 100, 1) if total > 0 else 0)
+    except (ValueError, IndexError):
+        stats.update(disk_used=0, disk_total=0, disk_percent=0)
+    out, _, _ = ssh.run_command(
+        "DEV=$(ip route | awk '/default/ {print $5}' | head -1); "
+        "cat /proc/net/dev | awk -v dev=\"$DEV:\" '$1==dev{printf \"%d %d\", $2, $10}'"
+    )
+    try:
+        parts = out.strip().split()
+        stats['net_rx'], stats['net_tx'] = int(parts[0]), int(parts[1])
+    except (ValueError, IndexError):
+        stats['net_rx'] = stats['net_tx'] = 0
+    out, _, _ = ssh.run_command("uptime -p 2>/dev/null || uptime")
+    stats['uptime'] = out.strip()
+    return stats
 
 
 @app.post('/api/servers/{server_id}/check', tags=["Servers"])
@@ -2099,67 +2118,72 @@ async def api_check_server(request: Request, server_id: int):
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        # Just use awg's docker checker since it uses the same command
-        manager = get_protocol_manager(ssh, 'awg')
-        status = {'connection': 'ok', 'docker_installed': manager.check_docker_installed(), 'protocols': {}}
-        
+
+        import concurrent.futures
+
+        def _probe(ssh):
+            # Just use awg's docker checker since it uses the same command
+            manager = get_protocol_manager(ssh, 'awg')
+            probed = {
+                'connection': 'ok',
+                'docker_installed': manager.check_docker_installed(),
+                'protocols': {},
+            }
+
+            def check_proto(proto):
+                try:
+                    p_manager = get_protocol_manager(ssh, proto)
+                    result = _manager_call(p_manager, 'get_server_status', proto)
+                    db_proto = server.get('protocols', {}).get(proto, {})
+                    if not result.get('port') and db_proto.get('port'):
+                        result['port'] = db_proto['port']
+                    return proto, result, None
+                except Exception as e:
+                    return proto, None, str(e)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
+                futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
+                return probed, [f.result() for f in concurrent.futures.as_completed(futures)]
+
+        status, results = await _ssh_session(server, _probe)
+
         changed = False
         if 'protocols' not in server:
             server['protocols'] = {}
 
-        import concurrent.futures
+        for proto, result, err in results:
+            if err:
+                status['protocols'][proto] = {'error': err}
+                continue
+            status['protocols'][proto] = result
+            if result.get('container_exists'):
+                prev = server['protocols'].get(proto, {})
+                record = {
+                    'installed': True,
+                    'port': result.get('port') or prev.get('port', '55424'),
+                    'awg_params': result.get('awg_params') or prev.get('awg_params', {}),
+                    # Cache running state + client count so the next page
+                    # load can paint the cards accurately before the live
+                    # check returns (see primeFromCache in server.html).
+                    'container_running': bool(result.get('container_running')),
+                }
+                if result.get('clients_count') is not None:
+                    record['clients_count'] = result.get('clients_count')
+                # Preserve panel-managed port config (advertised/published)
+                # — it isn't reported by the live status probe.
+                for k in ('advertised_port', 'published_ports'):
+                    if prev.get(k) is not None:
+                        record[k] = prev[k]
+                if record != prev:
+                    server['protocols'][proto] = record
+                    changed = True
+            elif proto in server['protocols']:
+                del server['protocols'][proto]
+                changed = True
 
-        def check_proto(proto):
-            try:
-                p_manager = get_protocol_manager(ssh, proto)
-                result = _manager_call(p_manager, 'get_server_status', proto)
-                db_proto = server.get('protocols', {}).get(proto, {})
-                if not result.get('port') and db_proto.get('port'):
-                    result['port'] = db_proto['port']
-                return proto, result, None
-            except Exception as e:
-                return proto, None, str(e)
-
-        with concurrent.futures.ThreadPoolExecutor(max_workers=9) as executor:
-            futures = [executor.submit(check_proto, p) for p in ['awg', 'awg2', 'awg_legacy', 'xray', 'telemt', 'dns', 'wireguard', 'socks5', 'adguard']]
-            for future in concurrent.futures.as_completed(futures):
-                proto, result, err = future.result()
-                if err:
-                    status['protocols'][proto] = {'error': err}
-                else:
-                    status['protocols'][proto] = result
-                    if result.get('container_exists'):
-                        prev = server['protocols'].get(proto, {})
-                        record = {
-                            'installed': True,
-                            'port': result.get('port') or prev.get('port', '55424'),
-                            'awg_params': result.get('awg_params') or prev.get('awg_params', {}),
-                            # Cache running state + client count so the next page
-                            # load can paint the cards accurately before the live
-                            # check returns (see primeFromCache in server.html).
-                            'container_running': bool(result.get('container_running')),
-                        }
-                        if result.get('clients_count') is not None:
-                            record['clients_count'] = result.get('clients_count')
-                        # Preserve panel-managed port config (advertised/published)
-                        # — it isn't reported by the live status probe.
-                        for k in ('advertised_port', 'published_ports'):
-                            if prev.get(k) is not None:
-                                record[k] = prev[k]
-                        if record != prev:
-                            server['protocols'][proto] = record
-                            changed = True
-                    else:
-                        if proto in server['protocols']:
-                            del server['protocols'][proto]
-                            changed = True
-                
         if changed:
             save_data(data)
-            
-        ssh.disconnect()
+
         return status
     except Exception as e:
         logger.exception("Error checking server")
@@ -3330,12 +3354,10 @@ async def api_get_server_clients(request: Request, server_id: int, protocol: str
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, protocol)
-        clients = manager.get_clients(protocol)
-        ssh.disconnect()
-        
+        clients = await _ssh_session(
+            server, lambda ssh: get_protocol_manager(ssh, protocol).get_clients(protocol)
+        )
+
         # Filter: only show clients that are not assigned to anyone in the panel
         assigned_ids = {c['client_id'] for c in data.get('user_connections', []) if c['server_id'] == server_id and c['protocol'] == protocol}
         
