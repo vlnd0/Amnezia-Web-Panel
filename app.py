@@ -750,6 +750,32 @@ def _manager_call(manager, method, protocol, *args, **kwargs):
     return fn(protocol, *args, **kwargs)
 
 
+async def _ssh_manager_call(server, protocol, method, *args, **kwargs):
+    """Run one manager call over a fresh SSH session in a worker thread.
+
+    The endpoints are `async def`, so doing paramiko I/O inline blocks the whole
+    event loop: one node round-trip (TCP connect + auth + several `docker exec`s)
+    takes seconds, and every other request — including cheap ones that never
+    touch a server — queues behind it. Under a handful of concurrent API calls
+    the panel stops answering entirely. Offloading keeps the loop free; a fresh
+    SSHManager per call means nothing is shared across threads.
+    """
+
+    def _run():
+        ssh = get_ssh(server)
+        ssh.connect()
+        try:
+            manager = get_protocol_manager(ssh, protocol)
+            return _manager_call(manager, method, protocol, *args, **kwargs)
+        finally:
+            try:
+                ssh.disconnect()
+            except Exception:
+                logger.warning("SSH disconnect failed", exc_info=True)
+
+    return await asyncio.to_thread(_run)
+
+
 def _client_port(proto_info):
     """Port to put in new client Endpoints: the advertised port if configured,
     else the wg listen port. Lets us hand out a new port while older ports
@@ -2455,11 +2481,7 @@ async def api_get_connections(request: Request, server_id: int, protocol: str = 
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, protocol)
-        clients = _manager_call(manager, 'get_clients', protocol)
-        ssh.disconnect()
+        clients = await _ssh_manager_call(server, protocol, 'get_clients')
 
         # Enrich with user info from user_connections
         user_conns = data.get('user_connections', [])
@@ -2492,13 +2514,9 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
         server = data['servers'][server_id]
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = _client_port(proto_info)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        
         if req.protocol == 'telemt':
-            result = manager.add_client(
-                req.protocol, req.name, server['host'], port,
+            result = await _ssh_manager_call(
+                server, req.protocol, 'add_client', req.name, server['host'], port,
                 telemt_quota=req.telemt_quota,
                 telemt_max_ips=req.telemt_max_ips,
                 telemt_expiry=req.telemt_expiry,
@@ -2507,10 +2525,13 @@ async def api_add_connection(request: Request, server_id: int, req: AddConnectio
                 max_tcp_conns=req.telemt_max_conns
             )
         elif req.protocol == 'wireguard':
-            result = manager.add_client(req.name, server['host'])
+            result = await _ssh_manager_call(
+                server, req.protocol, 'add_client', req.name, server['host']
+            )
         else:
-            result = manager.add_client(req.protocol, req.name, server['host'], port)
-        ssh.disconnect()
+            result = await _ssh_manager_call(
+                server, req.protocol, 'add_client', req.name, server['host'], port
+            )
 
         if result.get('config'):
             result['vpn_link'] = generate_vpn_link(result['config'])
@@ -2546,11 +2567,7 @@ async def api_remove_connection(request: Request, server_id: int, req: Connectio
         server = data['servers'][server_id]
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        _manager_call(manager, 'remove_client', req.protocol, req.client_id)
-        ssh.disconnect()
+        await _ssh_manager_call(server, req.protocol, 'remove_client', req.client_id)
         # Remove from user_connections
         data['user_connections'] = [
             c for c in data.get('user_connections', [])
@@ -2573,10 +2590,6 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             return JSONResponse({'error': 'Server not found'}, status_code=404)
         server = data['servers'][server_id]
         
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        
         edit_params = {}
         if req.protocol == 'telemt':
             edit_params['telemt_quota'] = req.telemt_quota
@@ -2585,10 +2598,10 @@ async def api_edit_connection(request: Request, server_id: int, req: EditConnect
             edit_params['secret'] = req.telemt_secret
             edit_params['user_ad_tag'] = req.telemt_ad_tag
             edit_params['max_tcp_conns'] = req.telemt_max_conns
-            
-        result = manager.edit_client(req.protocol, req.client_id, edit_params)
-        ssh.disconnect()
-        return result
+
+        return await _ssh_manager_call(
+            server, req.protocol, 'edit_client', req.client_id, edit_params
+        )
     except Exception as e:
         logger.exception("Error editing connection")
         return JSONResponse({'error': str(e)}, status_code=500)
@@ -2616,11 +2629,10 @@ async def api_get_connection_config(request: Request, server_id: int, req: Conne
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
         proto_info = server.get('protocols', {}).get(req.protocol, {})
         port = _client_port(proto_info)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        config = _manager_call(manager, 'get_client_config', req.protocol, req.client_id, server['host'], port)
-        ssh.disconnect()
+        config = await _ssh_manager_call(
+            server, req.protocol, 'get_client_config',
+            req.client_id, server['host'], port,
+        )
         vpn_link = generate_vpn_link(config) if config else ''
         return {'config': config, 'vpn_link': vpn_link}
     except Exception as e:
@@ -2639,11 +2651,9 @@ async def api_toggle_connection(request: Request, server_id: int, req: ToggleCon
         server = data['servers'][server_id]
         if not req.client_id:
             return JSONResponse({'error': 'Client ID is required'}, status_code=400)
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
-        _manager_call(manager, 'toggle_client', req.protocol, req.client_id, req.enable)
-        ssh.disconnect()
+        await _ssh_manager_call(
+            server, req.protocol, 'toggle_client', req.client_id, req.enable
+        )
         status = 'enabled' if req.enable else 'disabled'
         return {'status': 'success', 'enabled': req.enable, 'message': f'Connection {status}'}
     except Exception as e:
@@ -2928,6 +2938,12 @@ async def api_add_user_connection(request: Request, user_id: str, req: AddUserCo
             save_data(data)
 
         resp = {'status': 'success'}
+        # The panel-side client_id is what callers need to toggle/remove this
+        # peer later. Without it here the only way back is a full
+        # `GET /servers/{id}/connections`, which re-SSHes into the node — the
+        # single most expensive call in the API. Hand it over directly.
+        if result.get('client_id'):
+            resp['client_id'] = result['client_id']
         if result.get('config'):
             resp['config'] = result['config']
             resp['vpn_link'] = generate_vpn_link(result['config'])
