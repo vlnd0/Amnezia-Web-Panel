@@ -2202,45 +2202,46 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             return JSONResponse({'error': 'Invalid protocol type'}, status_code=400)
 
         server = data['servers'][server_id]
-        ssh = get_ssh(server)
-        ssh.connect()
-        manager = get_protocol_manager(ssh, req.protocol)
 
-        # Pass parameters to installer
-        if req.protocol == 'telemt':
-            result = manager.install_protocol(
-                protocol_type=req.protocol,
-                port=req.port,
-                tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
-                tls_domain=req.tls_domain,
-                max_connections=req.max_connections if req.max_connections is not None else 0
-            )
-        elif req.protocol == 'xray':
-            result = manager.install_protocol(port=req.port)
-        elif req.protocol == 'wireguard':
-            result = manager.install_protocol(port=req.port)
-        elif req.protocol == 'socks5':
-            result = manager.install_protocol(
-                protocol_type='socks5',
-                port=req.port,
-                username=req.socks5_username,
-                password=req.socks5_password,
-            )
-        elif req.protocol == 'adguard':
-            result = manager.install_protocol(
-                protocol_type='adguard',
-                mode=req.adguard_mode or 'sidebyside',
-                web_port=req.adguard_web_port,
-                expose_web=bool(req.adguard_expose_web),
-                dns_port=req.port,
-                dot_port=req.adguard_dot_port,
-                doh_port=req.adguard_doh_port,
-                expose_dns=bool(req.adguard_expose_dns),
-                expose_dot=bool(req.adguard_expose_dot),
-                expose_doh=bool(req.adguard_expose_doh),
-            )
-        else:
-            result = manager.install_protocol(req.protocol, port=req.port)
+        def _install(ssh):
+            manager = get_protocol_manager(ssh, req.protocol)
+
+            # Pass parameters to installer
+            if req.protocol == 'telemt':
+                return manager.install_protocol(
+                    protocol_type=req.protocol,
+                    port=req.port,
+                    tls_emulation=req.tls_emulation if req.tls_emulation is not None else True,
+                    tls_domain=req.tls_domain,
+                    max_connections=req.max_connections if req.max_connections is not None else 0
+                )
+            if req.protocol in ('xray', 'wireguard'):
+                return manager.install_protocol(port=req.port)
+            if req.protocol == 'socks5':
+                return manager.install_protocol(
+                    protocol_type='socks5',
+                    port=req.port,
+                    username=req.socks5_username,
+                    password=req.socks5_password,
+                )
+            if req.protocol == 'adguard':
+                return manager.install_protocol(
+                    protocol_type='adguard',
+                    mode=req.adguard_mode or 'sidebyside',
+                    web_port=req.adguard_web_port,
+                    expose_web=bool(req.adguard_expose_web),
+                    dns_port=req.port,
+                    dot_port=req.adguard_dot_port,
+                    doh_port=req.adguard_doh_port,
+                    expose_dns=bool(req.adguard_expose_dns),
+                    expose_dot=bool(req.adguard_expose_dot),
+                    expose_doh=bool(req.adguard_expose_doh),
+                )
+            return manager.install_protocol(req.protocol, port=req.port)
+
+        # Installing builds an image and starts a container — minutes of SSH
+        # work. Inline, that freezes the whole panel for the duration.
+        result = await _ssh_session(server, _install, lock=True)
 
         proto_record = {
             'installed': True,
@@ -2254,7 +2255,6 @@ async def api_install_protocol(request: Request, server_id: int, req: InstallPro
             proto_record['expose_web'] = result.get('expose_web')
         server['protocols'][req.protocol] = proto_record
         save_data(data)
-        ssh.disconnect()
         return result
     except Exception as e:
         logger.exception("Error installing protocol")
