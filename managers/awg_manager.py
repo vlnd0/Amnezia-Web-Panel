@@ -1138,22 +1138,38 @@ done
         self.ssh.run_sudo_command(f"mkdir -p {dockerfile_folder}")
         self.ssh.upload_file_sudo(dockerfile_content, f"{dockerfile_folder}/Dockerfile")
 
-        # Stream the build output to a log file on the server and only tail
-        # it back: BuildKit progress is megabytes of stderr, and pushing that
-        # through the SSH channel both starves the channel window (the command
-        # can stall or die mid-build on flaky links) and loses the actual
-        # error text. The file keeps the full log for post-mortem.
+        # Run the build detached and poll for its exit code. On flaky links
+        # the SSH channel dies seconds into the build while the docker daemon
+        # keeps building - a synchronous wait then reports a false failure
+        # for a build that actually succeeded. Detached, the build is immune
+        # to channel/transport drops; each poll is a fresh short channel.
         build_log = f"/tmp/docker-build-{container_name}.log"
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder} "
-            f"> {build_log} 2>&1; code=$?; tail -c 6000 {build_log}; exit $code",
-            timeout=900
+        code_file = f"{build_log}.code"
+        self.ssh.run_sudo_command(f"rm -f {build_log} {code_file}")
+        self.ssh.run_sudo_command(
+            f"nohup sh -c 'docker build --no-cache --pull -t {container_name} "
+            f"{dockerfile_folder} > {build_log} 2>&1; echo $? > {code_file}' "
+            f">/dev/null 2>&1 &",
+            timeout=30
         )
-        if code != 0:
-            detail = (out or '').strip() or (err or '').strip() or (
-                f"no output at all (possibly killed by the 900s timeout); "
-                f"full log on the server: {build_log}"
-            )
+        build_code = None
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            time.sleep(5)
+            out, err, code = self.ssh.run_sudo_command(
+                f"cat {code_file} 2>/dev/null", timeout=30)
+            if code == 0 and (out or '').strip().isdigit():
+                build_code = int(out.strip())
+                break
+        if build_code is None:
+            raise RuntimeError(
+                f"Build did not finish within 900s; "
+                f"full log on the server: {build_log}")
+        if build_code != 0:
+            out, err, _ = self.ssh.run_sudo_command(
+                f"tail -c 6000 {build_log}", timeout=30)
+            detail = (out or '').strip() or (
+                f"no output; full log on the server: {build_log}")
             raise RuntimeError(f"Failed to build container: {detail}")
         results.append("Docker image built successfully")
 
