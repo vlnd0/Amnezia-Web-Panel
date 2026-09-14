@@ -1138,16 +1138,21 @@ done
         self.ssh.run_sudo_command(f"mkdir -p {dockerfile_folder}")
         self.ssh.upload_file_sudo(dockerfile_content, f"{dockerfile_folder}/Dockerfile")
 
+        # Stream the build output to a log file on the server and only tail
+        # it back: BuildKit progress is megabytes of stderr, and pushing that
+        # through the SSH channel both starves the channel window (the command
+        # can stall or die mid-build on flaky links) and loses the actual
+        # error text. The file keeps the full log for post-mortem.
+        build_log = f"/tmp/docker-build-{container_name}.log"
         out, err, code = self.ssh.run_sudo_command(
-            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder}",
+            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder} "
+            f"> {build_log} 2>&1; code=$?; tail -c 6000 {build_log}; exit $code",
             timeout=900
         )
         if code != 0:
-            # BuildKit writes progress to stderr; a timeout kill leaves no
-            # error text at all - say so explicitly and show the stdout tail.
-            detail = (err or '').strip() or (
-                f"no error output (possibly killed by the 900s timeout). "
-                f"Last output: ...{(out or '')[-500:]}"
+            detail = (out or '').strip() or (err or '').strip() or (
+                f"no output at all (possibly killed by the 900s timeout); "
+                f"full log on the server: {build_log}"
             )
             raise RuntimeError(f"Failed to build container: {detail}")
         results.append("Docker image built successfully")
