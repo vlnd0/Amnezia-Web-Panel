@@ -1140,10 +1140,16 @@ done
 
         out, err, code = self.ssh.run_sudo_command(
             f"docker build --no-cache --pull -t {container_name} {dockerfile_folder}",
-            timeout=300
+            timeout=900
         )
         if code != 0:
-            raise RuntimeError(f"Failed to build container: {err}")
+            # BuildKit writes progress to stderr; a timeout kill leaves no
+            # error text at all - say so explicitly and show the stdout tail.
+            detail = (err or '').strip() or (
+                f"no error output (possibly killed by the 900s timeout). "
+                f"Last output: ...{(out or '')[-500:]}"
+            )
+            raise RuntimeError(f"Failed to build container: {detail}")
         results.append("Docker image built successfully")
 
         # Step 5: Run container
