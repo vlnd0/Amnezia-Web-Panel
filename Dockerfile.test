@@ -1,0 +1,9 @@
+FROM python:3.11-slim
+RUN apt-get update && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /app
+COPY requirements.txt .
+RUN pip install --no-cache-dir -r requirements.txt pytest==8.4.2 flake8==7.3.0
+COPY . .
+ENV PYTHONDONTWRITEBYTECODE=1 DATA_FILE=/tmp/panel-test-data.json
+CMD ["sh", "-c", "python -m flake8 --select=E9,F821,F822,F823 app.py managers connection_service.py exit_link_service.py && python -m pytest -q --disable-warnings --ignore=tests/test_playwright_e2e.py"]

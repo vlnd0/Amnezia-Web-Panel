@@ -16,24 +16,34 @@ import hashlib
 import ipaddress
 import logging
 import re
+import time
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
+from .serialization import serialized_manager
 
 logger = logging.getLogger(__name__)
+
+# Dual-stack behaviour for AWG tunnels, overridable like the panel's other
+# environment knobs (SECRET_KEY, TUNNEL_BIN_DIR): "auto" probes the server,
+# "off" keeps every tunnel IPv4-only, "on" forces dual-stack.
+AWG_IPV6_ENV = 'AWG_IPV6'
+IPV6_FORCE_OFF = ('off', 'false', '0', 'no', 'disable', 'disabled')
+IPV6_FORCE_ON = ('on', 'true', '1', 'yes', 'force', 'forced')
 
 # Default AWG parameters (from protocols_defs.h)
 AWG_DEFAULTS = {
     'port': '55424',
-    'mtu': '1280',
-    # /16 keeps the pool large enough for tens of thousands of clients so the
-    # 4th octet never has to overflow (the old /24 capped at 253 and the
-    # allocator used to emit invalid octets like 10.8.1.324 past that point).
+    'mtu': '1376',
     'subnet_address': '10.8.0.0',
     'subnet_cidr': '16',
     'subnet_ip': '10.8.1.1',
-    'dns1': '1.1.1.1',
+    # IPv6 ULA subnet used for dual-stack tunnels (NAT66, no provider prefix needed)
+    'subnet_ipv6_ip': 'fd42:8:1::1',
+    'subnet_ipv6_cidr': '64',    'dns1': '1.1.1.1',
     'dns2': '1.0.0.1',
+    # Default IPv6 resolver appended to client DNS when the tunnel is dual-stack
+    'dns6': '2606:4700:4700::1111',
     # AWG obfuscation parameters
     'junk_packet_count': '3',
     'junk_packet_min_size': '10',
@@ -47,6 +57,189 @@ AWG_DEFAULTS = {
     'transport_packet_magic_header': '2528465083',
     'underload_packet_magic_header': '1766607858',
 }
+
+# AWG 3.1 parameters: (internal key, config key).
+# HeaderProtectionKey/ContentPaddingAddition and the timings came with 3.0,
+# RandomTrailers/DisableCookies with 3.1. Ranges use the "min-max" form.
+AWG3_PARAM_MAP = [
+    ('header_protection_key', 'HeaderProtectionKey'),
+    ('content_padding_addition', 'ContentPaddingAddition'),
+    ('rekey_after_time', 'RekeyAfterTime'),
+    ('rekey_timeout', 'RekeyTimeout'),
+    ('reject_after_time', 'RejectAfterTime'),
+    ('keepalive_timeout', 'KeepaliveTimeout'),
+    ('max_handshake_attempts', 'MaxHandshakeAttempts'),
+    ('random_trailers', 'RandomTrailers'),
+    ('disable_cookies', 'DisableCookies'),
+]
+
+# AWG 3.1 keys must not leak into legacy configs — the legacy container
+# ships tools that reject them.
+AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
+
+# With HeaderProtectionKey set, the kernel module requires every junk size
+# S1-S4 to be at least HEADER_PROTECTION_NONCE_SIZE (12) — see the S1..S4
+# checks in netlink.c. Below that `awg setconf` fails with a bare
+# "Invalid argument": the explanation only goes to net_dbg_ratelimited.
+AWG3_MIN_JUNK_SIZE = 12
+
+# AWG 3.1 keys only exist in amneziawg kernel module 3.0+ (the 1.0.x line the
+# Amnezia PPA still ships predates them). awg-quick prefers the host module and
+# falls back to amneziawg-go only when `ip link add ... type amneziawg` fails,
+# i.e. when no module is installed at all. With an older module loaded the
+# interface is created, `awg setconf` then fails with a bare "Invalid argument"
+# and awg-quick deletes the interface again: the install reports success and no
+# tunnel exists (issue #113). The container's amneziawg-go does speak the full
+# 3.1 key set, so the way out is to force userspace for awg3 on such hosts.
+AWG3_MIN_KERNEL_MODULE_MAJOR = 3
+
+# awg-quick has no switch for that, so the image gets a one-line patch adding
+# one. Without WG_FORCE_USERSPACE set the function behaves exactly as before.
+AWG_QUICK_FORCE_USERSPACE_PATCH = (
+    'RUN sed -i \'s|if ! cmd ip link add "$INTERFACE" type amneziawg; then'
+    '|if [ -n "$WG_FORCE_USERSPACE" ]; then'
+    ' cmd "${WG_QUICK_USERSPACE_IMPLEMENTATION:-amneziawg-go}" "$INTERFACE";'
+    ' return 0; fi;'
+    ' if ! cmd ip link add "$INTERFACE" type amneziawg; then|\' /usr/bin/awg-quick'
+    ' && grep -q WG_FORCE_USERSPACE /usr/bin/awg-quick\n'
+)
+
+# Entry side of an exit-node link: a second WireGuard interface inside the
+# protocol container plus policy routing that sends the client subnet through
+# it. State is file-driven - exit0.conf present means "linked" - so the same
+# shell block runs at container start and when the panel (un)links live.
+EXIT_DIR = '/opt/amnezia/awg/exit'
+EXIT_CONF = f'{EXIT_DIR}/exit0.conf'
+EXIT_KEY = f'{EXIT_DIR}/exit_private.key'
+EXIT_IFACE = 'exit0'
+EXIT_TABLE = 200
+EXIT_MTU = 1420
+EXIT_HANDSHAKE_UP_SECONDS = 300  # REJECT_AFTER_TIME (180) + keepalive slack; 180 itself flaps on idle links
+DNS_NET = '172.29.172.0/24'      # amnezia-dns-net: AmneziaDNS / AdGuard live here, reached via eth1
+ENTRY_PRIVATE_KEY_PLACEHOLDER = '__ENTRY_PRIVATE_KEY__'
+
+# Egress check: the container asks a public "what is my IP" service twice -
+# once bound to the tunnel gateway (that source address is what policy routing
+# sends through exit0, i.e. exactly the client path) and once unbound. Two
+# services, so a single one being down does not read as "no egress".
+EGRESS_CHECK_URLS = ('https://api.ipify.org', 'https://ifconfig.me/ip')
+EGRESS_CHECK_TIMEOUT = 8
+IPV4_RE = re.compile(r'^\d{1,3}(?:\.\d{1,3}){3}$')
+
+# Obfuscation keys carried on a transit link (exit node <-> entry node). S3/S4
+# pad every cookie/transport packet and would eat the MTU budget of a tunnel
+# inside a tunnel, so only the handshake-side keys are used on that hop.
+TRANSIT_PARAM_KEYS = (
+    ('junk_packet_count', 'Jc'),
+    ('junk_packet_min_size', 'Jmin'),
+    ('junk_packet_max_size', 'Jmax'),
+    ('init_packet_junk_size', 'S1'),
+    ('response_packet_junk_size', 'S2'),
+    ('init_packet_magic_header', 'H1'),
+    ('response_packet_magic_header', 'H2'),
+    ('underload_packet_magic_header', 'H3'),
+    ('transport_packet_magic_header', 'H4'),
+)
+
+# Runs inside the awg3 container before awg-quick. Creating a throwaway
+# interface both loads the module (a module present on disk but not yet loaded
+# would otherwise read as absent) and proves the container can reach it.
+AWG3_USERSPACE_GUARD = """
+# AWG 3.1 needs amneziawg kernel module 3.0+; an older one accepts the
+# interface but rejects the config, and awg-quick will not fall back once
+# `ip link add` has succeeded (issue #113).
+if ip link add awgprobe type amneziawg 2>/dev/null; then
+  KMOD_VERSION=$(cat /sys/module/amneziawg/version 2>/dev/null)
+  ip link delete awgprobe 2>/dev/null
+  case "$KMOD_VERSION" in
+    3.*|[4-9].*|[1-9][0-9].*) ;;
+    *) echo "amneziawg kernel module ${KMOD_VERSION:-unknown} predates AWG 3.1, using userspace amneziawg-go"
+       export WG_FORCE_USERSPACE=1 ;;
+  esac
+fi
+"""
+
+# Special junk packets I1-I5: free-form packets the peer sends right before
+# the handshake initiation, so a session opens with bytes that belong to some
+# other protocol. The kernel module parses each value as a list of tags
+# (jp_parse_tags in junk.c):
+#   <b 0xHEX>  fixed bytes          <r N>   N random bytes
+#   <c>        packet counter, 4B   <rc N>  N random latin letters
+#   <t>        unix time, 4B        <rd N>  N random digits
+SPECIAL_JUNK_KEYS = ('i1', 'i2', 'i3', 'i4', 'i5')
+
+# Byte-identical to protocols::awg::defaultSpecialJunk1 in the desktop client:
+# a DNS response for icloud.com preceded by a random 2-byte transaction id.
+AWG_DEFAULT_I1 = (
+    '<r 2><b 0x858000010001000000000669636c6f756403636f6d'
+    '0000010001c00c000100010000105a00044d583737>'
+)
+
+_SPECIAL_JUNK_TAG_RE = re.compile(r'<\s*(b|c|t|r|rc|rd)(?:\s+([^>]*?))?\s*>')
+
+# A junk packet still has to fit into one datagram.
+SPECIAL_JUNK_MAX_SIZE = 1280
+
+
+def validate_special_junk(value):
+    """Validate an I1-I5 value and return the packet size it produces."""
+    text = (value or '').strip()
+    if not text:
+        return 0
+
+    size = 0
+    pos = 0
+    for match in _SPECIAL_JUNK_TAG_RE.finditer(text):
+        between = text[pos:match.start()].strip()
+        if between:
+            raise ValueError(f"unexpected text outside a tag: {between!r}")
+        pos = match.end()
+
+        tag = match.group(1)
+        arg = (match.group(2) or '').strip()
+        if tag in ('c', 't'):
+            if arg:
+                raise ValueError(f"<{tag}> takes no argument")
+            size += 4
+        elif tag == 'b':
+            digits = arg[2:] if arg[:2].lower() == '0x' else ''
+            if not digits or len(digits) % 2 or not all(c in '0123456789abcdefABCDEF' for c in digits):
+                raise ValueError("<b> expects an even number of hex digits, e.g. <b 0xdeadbeef>")
+            size += len(digits) // 2
+        else:
+            if not arg.isdigit() or int(arg) <= 0:
+                raise ValueError(f"<{tag}> expects a positive byte count, e.g. <{tag} 16>")
+            size += int(arg)
+
+    trailing = text[pos:].strip()
+    if trailing:
+        raise ValueError(f"unexpected text outside a tag: {trailing!r}")
+    if size == 0:
+        raise ValueError("no packet tags found, nothing would be sent")
+    if size > SPECIAL_JUNK_MAX_SIZE:
+        raise ValueError(f"packet is {size} bytes, maximum is {SPECIAL_JUNK_MAX_SIZE}")
+    return size
+
+
+def normalize_special_junk(values):
+    """Validate an {'i1': ..., 'i5': ...} mapping and drop empty entries."""
+    result = {}
+    for key in SPECIAL_JUNK_KEYS:
+        value = (values or {}).get(key)
+        value = (value or '').strip()
+        if not value:
+            continue
+        try:
+            validate_special_junk(value)
+        except ValueError as exc:
+            raise ValueError(f"{key.upper()}: {exc}") from exc
+        result[key] = value
+    return result
+
+# Connection flood monitoring (P2P/torrent detection)
+CONN_WARN_THRESHOLD = 600    # simultaneous connections per peer that trigger a warning
+CONN_WARN_COOLDOWN = 3600    # min seconds between two recorded warnings for the same peer
+CONN_WARN_MAX_EVENTS = 5     # how many recent warnings are kept per peer
 
 
 def generate_wg_keypair():
@@ -69,23 +262,28 @@ def generate_psk():
     return b64encode(secrets.token_bytes(32)).decode()
 
 
-def generate_awg_params(use_ranges=False):
+def generate_awg_params(use_ranges=False, awg3=False):
     """Generate random AWG obfuscation parameters.
     
     For AWG 2.0 (use_ranges=True): generates H1-H4 as non-overlapping
     ranges (min-max) for dynamic packet signature. Each packet gets a
     random value from its range, defeating static DPI signatures.
     For legacy AWG (use_ranges=False): generates fixed single H values.
+    For AWG 3.1 (awg3=True): additionally generates header protection key,
+    content padding and randomized protocol timings.
+    Non-legacy protocols also get the default special junk packet (I1).
     """
     import random
 
     jc = random.randint(1, 10)
     jmin = random.randint(5, 20)
     jmax = random.randint(jmin + 10, jmin + 50)
-    s1 = random.randint(10, 50)
-    s2 = random.randint(10, 50)
-    s3 = random.randint(10, 50)
-    s4 = random.randint(10, 50)
+    # AWG 3.1 enables header protection, which puts a floor under the junk sizes.
+    s_min = AWG3_MIN_JUNK_SIZE if awg3 else 10
+    s1 = random.randint(s_min, 50)
+    s2 = random.randint(s_min, 50)
+    s3 = random.randint(s_min, 50)
+    s4 = random.randint(s_min, 50)
 
     if use_ranges:
         # AWG 2.0: H1-H4 as non-overlapping ranges (min-max)
@@ -104,13 +302,23 @@ def generate_awg_params(use_ranges=False):
             return result
         
         h1, h2, h3, h4 = make_ranges()
+    elif awg3:
+        # AWG 3.1: the official docs prescribe the compatibility values
+        # 1,2,3,4 when HeaderProtection is enabled - the custom-header
+        # mechanism is OFF then and Header Protection (ChaCha20 with the
+        # random per-server HeaderProtectionKey) hides the message type.
+        # This is exactly what the native AmneziaVPN client generates.
+        # Ranged H1-H4 with RandomTrailers=on are actively harmful:
+        # transport packets get misclassified as handshakes and die at
+        # CheckMAC1 (amneziawg-go#186, kernel-module#226).
+        h1, h2, h3, h4 = '1', '2', '3', '4'
     else:
         h1 = str(random.randint(100000000, 4294967295))
         h2 = str(random.randint(100000000, 4294967295))
         h3 = str(random.randint(100000000, 4294967295))
         h4 = str(random.randint(100000000, 4294967295))
 
-    return {
+    params = {
         'junk_packet_count': str(jc),
         'junk_packet_min_size': str(jmin),
         'junk_packet_max_size': str(jmax),
@@ -124,7 +332,38 @@ def generate_awg_params(use_ranges=False):
         'transport_packet_magic_header': h4,
     }
 
+    if use_ranges:
+        # The desktop client ships a special junk packet out of the box; not
+        # setting one leaves the first packet of every session recognisable.
+        params['i1'] = AWG_DEFAULT_I1
 
+    if awg3:
+        # Ranges are "min-max" (u16_range_from_string in amneziawg-tools).
+        # reject_after_time must stay above rekey_after_time, otherwise a
+        # session is dropped before the rekey window opens.
+        rekey_after = random.randint(100, 130)
+        reject_after = random.randint(rekey_after + 40, rekey_after + 70)
+        keepalive = random.randint(8, 12)
+        rekey_timeout = random.randint(4, 6)
+        attempts = random.randint(15, 20)
+        padding_min = random.randint(8, 24)
+
+        params.update({
+            'header_protection_key': generate_psk(),
+            'content_padding_addition': f"{padding_min}-{padding_min + random.randint(24, 48)}",
+            'rekey_after_time': f"{rekey_after}-{rekey_after + random.randint(10, 40)}",
+            'rekey_timeout': f"{rekey_timeout}-{rekey_timeout + random.randint(1, 3)}",
+            'reject_after_time': f"{reject_after}-{reject_after + random.randint(10, 30)}",
+            'keepalive_timeout': f"{keepalive}-{keepalive + random.randint(2, 6)}",
+            'max_handshake_attempts': f"{attempts}-{attempts + random.randint(2, 6)}",
+            'random_trailers': 'on',
+            'disable_cookies': 'on',
+        })
+
+    return params
+
+
+@serialized_manager
 class AWGManager:
     """Manages AmneziaWG protocol installation and client management."""
 
@@ -132,21 +371,49 @@ class AWGManager:
     AWG = 'awg'          # New AWG (awg-go based, uses awg/awg-quick)
     AWG_LEGACY = 'awg_legacy'  # Legacy AWG (uses wg/wg-quick)
     AWG2 = 'awg2'        # AmneziaWG 2.0 (separate container amnezia-awg2)
+    AWG3 = 'awg3'        # AmneziaWG 3.1 (separate container amnezia-awg3)
 
     def __init__(self, ssh_manager):
         self.ssh = ssh_manager
+        # Short-lived caches: a single UI refresh asks for the same config
+        # path/content several times; each call is a separate SSH command.
+        # 10s TTL keeps edits visible while collapsing duplicates.
+        self._config_path_cache = {}   # protocol_type -> (ts, path)
+        self._server_config_cache = {} # protocol_type -> (ts, content)
+        self._CACHE_TTL = 10
+
+    def _base_protocol(self, protocol_type):
+        """Return base protocol for instance keys like awg__2."""
+        return str(protocol_type or self.AWG).split('__', 1)[0]
+
+    def _instance_index(self, protocol_type):
+        parts = str(protocol_type or '').split('__', 1)
+        if len(parts) == 2:
+            try:
+                return max(1, int(parts[1]))
+            except ValueError:
+                return 1
+        return 1
 
     def _container_name(self, protocol_type):
-        """Get Docker container name for protocol type."""
-        if protocol_type == self.AWG_LEGACY:
-            return 'amnezia-awg-legacy'
-        if protocol_type == self.AWG2:
-            return 'amnezia-awg2'
-        return 'amnezia-awg'
+        """Get Docker container name for protocol type/instance.
+        First instances keep legacy names; additional instances get -N suffix.
+        """
+        base = self._base_protocol(protocol_type)
+        idx = self._instance_index(protocol_type)
+        if base == self.AWG_LEGACY:
+            name = 'amnezia-awg-legacy'
+        elif base == self.AWG2:
+            name = 'amnezia-awg2'
+        elif base == self.AWG3:
+            name = 'amnezia-awg3'
+        else:
+            name = 'amnezia-awg'
+        return name if idx <= 1 else f'{name}-{idx}'
 
     def _config_path(self, protocol_type):
         """Get server config path inside container."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return '/opt/amnezia/awg/wg0.conf'
         # Both AWG and AWG2 use awg0.conf
         return '/opt/amnezia/awg/awg0.conf'
@@ -154,7 +421,7 @@ class AWGManager:
     def _config_path_candidates(self, protocol_type):
         """Return possible config paths, ordered by the expected path first."""
         expected = self._config_path(protocol_type)
-        fallback = '/opt/amnezia/awg/awg0.conf' if protocol_type == self.AWG_LEGACY else '/opt/amnezia/awg/wg0.conf'
+        fallback = '/opt/amnezia/awg/awg0.conf' if self._base_protocol(protocol_type) == self.AWG_LEGACY else '/opt/amnezia/awg/wg0.conf'
         return [expected, fallback]
 
     def _resolve_config_path(self, protocol_type):
@@ -165,19 +432,22 @@ class AWGManager:
         instead of requiring users to create symlinks inside the container.
         """
         container_name = self._container_name(protocol_type)
+        cached = self._config_path_cache.get(protocol_type)
+        if cached and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1]
         candidates = self._config_path_candidates(protocol_type)
         paths = ' '.join(candidates)
         script = f'for p in {paths}; do if [ -f "$p" ]; then echo "$p"; exit 0; fi; done; exit 1'
         out, _, code = self.ssh.run_sudo_command(
             f"docker exec -i {container_name} sh -c '{script}'"
         )
-        if code == 0 and out.strip():
-            return out.strip().splitlines()[0]
-        return self._config_path(protocol_type)
+        result = out.strip().splitlines()[0] if code == 0 and out.strip() else self._config_path(protocol_type)
+        self._config_path_cache[protocol_type] = (time.time(), result)
+        return result
 
     def _wg_binary(self, protocol_type):
         """Get the wireguard binary name."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg'
         # AWG and AWG2 both use 'awg' binary
         return 'awg'
@@ -185,7 +455,7 @@ class AWGManager:
 
     def _quick_binary(self, protocol_type):
         """Get the wireguard-quick binary name."""
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg-quick'
         # AWG and AWG2 both use 'awg-quick'
         return 'awg-quick'
@@ -195,20 +465,188 @@ class AWGManager:
         """Get the interface name."""
         if config_path:
             return os.path.splitext(os.path.basename(config_path))[0]
-        if protocol_type == self.AWG_LEGACY:
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
             return 'wg0'
         # AWG and AWG2 both use 'awg0' interface
         return 'awg0'
 
     def _docker_image(self, protocol_type):
         """Get Docker image for protocol type."""
-        if protocol_type in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             return 'amneziavpn/amneziawg-go:latest'
         return 'amneziavpn/amnezia-wg:latest'
 
     def _clients_table_path(self):
         """Path to the clients table file inside container."""
         return '/opt/amnezia/awg/clientsTable'
+
+    def _get_subnet_ip(self, protocol_type):
+        """Get the subnet IP (gateway) from server config, or fallback to default."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                if line.startswith('Address'):
+                    # Take the first (IPv4) part of a possibly dual-stack Address line
+                    addr = line.split('=')[1].strip().split(',')[0].strip()
+                    ip = addr.split('/')[0]
+                    return ip
+        except Exception:
+            pass
+        return AWG_DEFAULTS['subnet_ip']
+
+    def _get_subnet_cidr(self, protocol_type):
+        """Get the subnet CIDR from server config, or fallback to default."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                if line.startswith('Address'):
+                    # Take the first (IPv4) part of a possibly dual-stack Address line
+                    addr = line.split('=')[1].strip().split(',')[0].strip()
+                    if '/' in addr:
+                        return addr.split('/')[1]
+        except Exception:
+            pass
+        return AWG_DEFAULTS['subnet_cidr']
+
+    def _get_subnet_base(self, protocol_type):
+        """Get the subnet network address (e.g. 172.16.21.0) from server config."""
+        subnet_ip = self._get_subnet_ip(protocol_type)
+        cidr = int(self._get_subnet_cidr(protocol_type))
+        parts = list(map(int, subnet_ip.split('.')))
+        mask = (0xFFFFFFFF << (32 - cidr)) & 0xFFFFFFFF
+        network = struct.pack('!I', (parts[0] << 24) | (parts[1] << 16) | (parts[2] << 8) | parts[3])
+        net_int = struct.unpack('!I', network)[0] & mask
+        net_parts = [(net_int >> 24) & 0xFF, (net_int >> 16) & 0xFF, (net_int >> 8) & 0xFF, net_int & 0xFF]
+        return '.'.join(map(str, net_parts))
+
+    def _get_subnet_ipv6_ip(self, protocol_type):
+        """Get the IPv6 gateway from server config, or '' if the tunnel is IPv4-only."""
+        try:
+            config = self._get_server_config(protocol_type)
+            for line in config.split('\n'):
+                line = line.strip()
+                if line.startswith('Address'):
+                    addr = line.split('=', 1)[1]
+                    for part in addr.split(','):
+                        part = part.strip()
+                        if ':' in part:
+                            return part.split('/')[0]
+        except Exception:
+            pass
+        return ''
+
+    def _get_client_ipv6(self, protocol_type, client_ip):
+        """Derive a client's IPv6 address from its IPv4 address.
+
+        The last hextet mirrors the IPv4 last octet (in hex), so every client
+        with 10.8.1.N deterministically gets <prefix>::<hex(N)>. Returns ''
+        when the server tunnel has no IPv6 gateway configured.
+        """
+        gateway = self._get_subnet_ipv6_ip(protocol_type)
+        if not gateway:
+            return ''
+        try:
+            octet = int(client_ip.split('.')[3])
+        except (ValueError, IndexError, AttributeError):
+            return ''
+        prefix = gateway.rsplit(':', 1)[0] + ':'
+        return f"{prefix}{octet:x}"
+
+    def _detect_server_ipv6(self, protocol_type=None):
+        """Decide whether the tunnel should be dual-stack.
+
+        The AWG_IPV6 environment variable forces the answer ("off" / "on");
+        in the default "auto" mode the server is probed.
+
+        Auto-detection requires IPv6 to work end-to-end: a global address on
+        the host *and* a default IPv6 route inside the protocol container.
+        Docker networks are IPv4-only unless the daemon is explicitly
+        configured for IPv6, so checking the host alone can enable a
+        dual-stack tunnel whose NAT66 has nowhere to forward. Clients then
+        receive an IPv6 address, an IPv6 DNS server and ::/0 with no route
+        out, which blackholes traffic on IPv6-preferring clients (notably
+        macOS) even though the host's own IPv6 is fine.
+        """
+        mode = os.environ.get(AWG_IPV6_ENV, 'auto').strip().lower()
+        if mode in IPV6_FORCE_OFF:
+            logger.info("%s=%s, keeping the tunnel IPv4-only", AWG_IPV6_ENV, mode)
+            return False
+        if mode in IPV6_FORCE_ON:
+            logger.info("%s=%s, forcing a dual-stack tunnel", AWG_IPV6_ENV, mode)
+            return True
+
+        out, _, _ = self.ssh.run_sudo_command("ip -6 route show default 2>/dev/null")
+        if not out.strip():
+            out, _, _ = self.ssh.run_sudo_command("ip -6 addr show scope global 2>/dev/null")
+            if not out.strip():
+                return False
+
+        if protocol_type is None:
+            return True
+
+        container_name = self._container_name(protocol_type)
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec {container_name} ip -6 route show default 2>/dev/null"
+        )
+        if out.strip():
+            return True
+
+        logger.info(
+            "Host has IPv6 but container %s has no IPv6 default route "
+            "(Docker IPv6 is disabled), keeping the tunnel IPv4-only",
+            container_name,
+        )
+        return False
+
+    def _userspace_guard(self, protocol_type):
+        """Shell snippet forcing userspace for awg3 on a pre-3.1 kernel module."""
+        if self._base_protocol(protocol_type) != self.AWG3:
+            return ''
+        return AWG3_USERSPACE_GUARD
+
+    def _host_awg_module_version(self):
+        """Version of the amneziawg kernel module on the host, or None.
+
+        modinfo covers the module that is installed but not loaded yet: the
+        container loads it implicitly on the first `ip link add`, so it counts.
+        """
+        out, _, _ = self.ssh.run_sudo_command(
+            "cat /sys/module/amneziawg/version 2>/dev/null || "
+            "modinfo -F version amneziawg 2>/dev/null"
+        )
+        version = out.strip().split('\n')[0].strip()
+        return version or None
+
+    @staticmethod
+    def _module_supports_awg3(version):
+        """Whether an amneziawg module version speaks the AWG 3.1 key set."""
+        try:
+            return int(version.split('.')[0]) >= AWG3_MIN_KERNEL_MODULE_MAJOR
+        except (AttributeError, ValueError):
+            return False
+
+    def _verify_interface_up(self, protocol_type):
+        """Fail loudly when the tunnel interface did not survive awg-quick.
+
+        A config the kernel module rejects leaves a running container with no
+        interface at all, which used to be reported to the UI as a successful
+        install (issue #113).
+        """
+        container_name = self._container_name(protocol_type)
+        iface = self._interface_name(protocol_type)
+        _, _, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} ip link show {iface}"
+        )
+        if code == 0:
+            return
+
+        logs, _, _ = self.ssh.run_sudo_command(
+            f"docker logs --tail 20 {container_name} 2>&1"
+        )
+        raise RuntimeError(
+            f"{iface} is not up in {container_name}: the tunnel config was "
+            f"rejected. Container log:\n{logs.strip()}"
+        )
 
     # ===================== INSTALLATION =====================
 
@@ -273,33 +711,289 @@ mkdir -p {dockerfile_folder}
 if ! docker network ls | grep -q amnezia-dns-net; then
   docker network create --driver bridge --subnet=172.29.172.0/24 --opt com.docker.network.bridge.name=amn0 amnezia-dns-net
 fi
+# Enable Docker IPv6 when the host has a global IPv6 address. Without this
+# containers get no IPv6 route and dual-stack tunnels silently fall back
+# to IPv4-only. Also enable ip6tables (+experimental): without them Docker
+# sets no NAT66 for the fixed-cidr-v6 ULA subnet and v6 traffic blackholes.
+# daemon.json is merged (not overwritten) and backed up. Docker is
+# restarted only when the file actually changed AND no amnezia-* or panel
+# containers are running - restarting the daemon mid-install kills every
+# container on the host (tunnels drop, a dockerized panel dies with its
+# own install request). Otherwise the restart is deferred and reported
+# as AWP_DOCKER_IPV6=pending so the install log can warn the admin.
+if ip -6 -o addr show scope global 2>/dev/null | grep -q inet6; then
+  cp /etc/docker/daemon.json /etc/docker/daemon.json.bak.awp 2>/dev/null
+  IPV6_CHANGED=$(python3 - <<'PYEOF' 2>/dev/null
+import json, os
+p = '/etc/docker/daemon.json'
+d = {{}}
+if os.path.exists(p):
+    d = json.load(open(p))
+need = {{'ipv6': True, 'experimental': True, 'ip6tables': True}}
+changed = False
+for k, v in need.items():
+    if d.get(k) != v:
+        d[k] = v; changed = True
+if 'fixed-cidr-v6' not in d:
+    d['fixed-cidr-v6'] = 'fd00:42::/64'; changed = True
+if changed:
+    json.dump(d, open(p, 'w'), indent=2)
+    print('yes')
+PYEOF
+)
+  if [ -z "$IPV6_CHANGED" ] && ! grep -q '"ipv6"' /etc/docker/daemon.json 2>/dev/null; then
+    echo '{{"ipv6": true, "fixed-cidr-v6": "fd00:42::/64", "experimental": true, "ip6tables": true}}' > /etc/docker/daemon.json
+    IPV6_CHANGED=yes
+  fi
+  if [ "$IPV6_CHANGED" = "yes" ]; then
+    if docker ps --format '{{{{.Names}}}}' 2>/dev/null | grep -qiE '^amnezia-|panel'; then
+      echo "AWP_DOCKER_IPV6=pending"
+    else
+      systemctl restart docker
+      echo "AWP_DOCKER_IPV6=restarted"
+    fi
+  else
+    echo "AWP_DOCKER_IPV6=ok"
+  fi
+fi
 """
         out, err, code = self.ssh.run_sudo_script(script)
         if code != 0:
             logger.warning(f"prepare_host warning: {err}")
-        return True
+        for line in (out or '').splitlines():
+            if line.startswith('AWP_DOCKER_IPV6='):
+                return line.split('=', 1)[1].strip()
+        return None
+
+    # Kernel module version that supports AWG 3.1 features and stays
+    # backward-compatible with AWG 2.0 configs.
+    AWG_MODULE_VERSION = "3.1.20260812"
+    AWG_MODULE_REPO = "https://github.com/amnezia-vpn/amneziawg-linux-kernel-module.git"
+
+    def setup_kernel_module(self):
+        """Install the amneziawg kernel module via DKMS (best effort).
+
+        Without the module, awg-quick inside the container falls back to
+        the userspace amneziawg-go implementation, which is noticeably
+        slower under load. The container mounts /lib/modules and has
+        SYS_MODULE capability, so once the module exists on the host,
+        awg-quick picks it automatically on (re)start.
+
+        Skipped (userspace fallback) when:
+        - module already present
+        - Secure Boot is enabled (unsigned module would not load)
+        - kernel headers / build tools cannot be installed
+        - the DKMS build fails (e.g. very old kernels)
+        """
+        v = self.AWG_MODULE_VERSION
+        script = f"""
+CUR=$(modinfo amneziawg 2>/dev/null | awk '/^version:/{{print $2; exit}}')
+if [ -n "$CUR" ] && [ "$CUR" = "{v}" ]; then
+    echo "KERNEL_MODULE: ok: already present ($CUR)"
+    exit 0
+fi
+if [ -n "$CUR" ]; then
+    # An older/newer module is present: upgrade. The module can only be
+    # unloaded when no tunnel uses it; otherwise defer the upgrade.
+    if ! modprobe -r amneziawg 2>/dev/null; then
+        echo "KERNEL_MODULE: skipped: version $CUR present but in use by running tunnels; stop all AWG containers and reinstall to upgrade to {v}"
+        exit 0
+    fi
+    dkms remove "amneziawg/$CUR" --all >/dev/null 2>&1 || true
+    echo "KERNEL_MODULE: upgrading from $CUR"
+fi
+if command -v mokutil >/dev/null 2>&1 && mokutil --sb-state 2>/dev/null | grep -qi 'enabled'; then
+    echo "KERNEL_MODULE: skipped: Secure Boot enabled (unsigned module would not load)"
+    exit 0
+fi
+KVER=$(uname -r)
+export DEBIAN_FRONTEND=noninteractive
+apt-get update -qq
+if ! apt-get install -y -qq dkms "linux-headers-$KVER" git make gcc >/tmp/awg-kmod.log 2>&1; then
+    if ! apt-cache show "linux-headers-$KVER" >/dev/null 2>&1; then
+        echo "KERNEL_MODULE: failed: headers for the running kernel $KVER are no longer in the repos - upgrade the kernel (apt install linux-image-amd64) and reboot, then reinstall the protocol"
+    else
+        echo "KERNEL_MODULE: failed: cannot install build tools: $(tail -3 /tmp/awg-kmod.log | tr '\\n' ' ' | cut -c1-300)"
+    fi
+    exit 1
+fi
+rm -rf /tmp/awg-module
+if ! git clone --depth 1 --branch v{v} {self.AWG_MODULE_REPO} /tmp/awg-module >>/tmp/awg-kmod.log 2>&1; then
+    echo "KERNEL_MODULE: failed: cannot clone the module repo (github.com unreachable?)"
+    exit 1
+fi
+cd /tmp/awg-module/src
+sed -i 's/^PACKAGE_VERSION=.*/PACKAGE_VERSION="{v}"/' dkms.conf
+if ! dkms add . >>/tmp/awg-kmod.log 2>&1; then
+    echo "KERNEL_MODULE: failed: dkms add failed: $(tail -3 /tmp/awg-kmod.log | tr '\\n' ' ' | cut -c1-300)"
+    exit 1
+fi
+if ! dkms build amneziawg/{v} >>/tmp/awg-kmod.log 2>&1; then
+    REASON=$(tail -5 /var/lib/dkms/amneziawg/{v}/build/make.log 2>/dev/null | tr '\\n' ' ' | cut -c1-300)
+    echo "KERNEL_MODULE: failed: dkms build failed: ${{REASON:-see /var/lib/dkms/amneziawg/{v}/build/make.log}}"
+    exit 1
+fi
+if ! dkms install amneziawg/{v} >>/tmp/awg-kmod.log 2>&1; then
+    echo "KERNEL_MODULE: failed: dkms install failed: $(tail -3 /tmp/awg-kmod.log | tr '\\n' ' ' | cut -c1-300)"
+    exit 1
+fi
+if ! modprobe amneziawg 2>/tmp/awg-kmod.log; then
+    echo "KERNEL_MODULE: failed: module built but modprobe failed: $(tail -2 /tmp/awg-kmod.log | tr '\\n' ' ' | cut -c1-200)"
+    exit 1
+fi
+cd / && rm -rf /tmp/awg-module
+echo "KERNEL_MODULE: ok: installed {v}"
+"""
+        try:
+            out, err, code = self.ssh.run_sudo_script(script, timeout=600)
+            marker = ''
+            for line in (out or '').splitlines():
+                if line.startswith('KERNEL_MODULE:'):
+                    marker = line.split(':', 1)[1].strip()
+                    logger.info(f"setup_kernel_module: {line}")
+            if not marker:
+                logger.warning(f"setup_kernel_module: no marker, userspace fallback: {err}")
+                return 'failed: no result (SSH or script error)'
+            return marker
+        except Exception as err:
+            logger.warning(f"setup_kernel_module warning (userspace fallback): {err}")
+            return f'failed: {err}'
 
     def setup_firewall(self):
-        """Setup host firewall (mirrors setup_host_firewall.sh)."""
+        """Setup host firewall (mirrors setup_host_firewall.sh).
+
+        Also raises net.netfilter.nf_conntrack_max: the default on small
+        VMs can be as low as ~7680 entries, and every client flow through
+        the NAT consumes one entry. A full conntrack table makes the
+        kernel silently drop packets ("nf_conntrack: table full"), which
+        users see as random connection freezes. 262144 is a safe value
+        for a VPN gateway; persisted via /etc/sysctl.d.
+        """
         script = """
 sysctl -w net.ipv4.ip_forward=1
+sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
 iptables -C INPUT -p icmp --icmp-type echo-request -j DROP 2>/dev/null || iptables -A INPUT -p icmp --icmp-type echo-request -j DROP
 iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-USER 2>/dev/null
+if [ -f /proc/sys/net/netfilter/nf_conntrack_max ]; then
+    cur=$(cat /proc/sys/net/netfilter/nf_conntrack_max)
+    if [ "$cur" -lt 262144 ] 2>/dev/null; then
+        printf '%s\n' 'net.netfilter.nf_conntrack_max = 262144' > /etc/sysctl.d/98-awp-conntrack.conf
+        sysctl -w net.netfilter.nf_conntrack_max=262144
+    fi
+fi
 """
         self.ssh.run_sudo_script(script)
         return True
 
-    def install_protocol(self, protocol_type, port=None, awg_params=None):
+    def setup_host_tuning(self):
+        """Enable BBR congestion control on the host (with persistence).
+
+        BBR is available in all kernels >= 4.9 (any modern Debian/Ubuntu).
+        If the tcp_bbr module is not loaded, load it and persist across
+        reboots. Falls back silently when the kernel has no BBR support.
+        BBR significantly outperforms cubic on lossy paths, which VPN
+        tunnels often traverse.
+        """
+        script = """
+set -e
+if ! sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    modprobe tcp_bbr 2>/dev/null || true
+fi
+if sysctl -n net.ipv4.tcp_available_congestion_control 2>/dev/null | grep -qw bbr; then
+    echo tcp_bbr > /etc/modules-load.d/awp-bbr.conf
+    printf '%s\\n' \\
+        'net.core.default_qdisc = fq' \\
+        'net.ipv4.tcp_congestion_control = bbr' \\
+        > /etc/sysctl.d/99-awp-bbr.conf
+    sysctl -w net.core.default_qdisc=fq
+    sysctl -w net.ipv4.tcp_congestion_control=bbr
+fi
+"""
+        try:
+            self.ssh.run_sudo_script(script)
+        except Exception as err:
+            logger.warning(f"setup_host_tuning warning: {err}")
+        return True
+
+    def get_host_tuning(self):
+        """Read live network-tuning state for the whole server (host + all
+        AWG containers). Used by the server-level "Host tuning" modal.
+        """
+        script = """
+echo "HOST_CC=$(sysctl -n net.ipv4.tcp_congestion_control 2>/dev/null)"
+echo "HOST_QDISC=$(sysctl -n net.core.default_qdisc 2>/dev/null)"
+echo "HOST_CONNTRACK=$(cat /proc/sys/net/netfilter/nf_conntrack_max 2>/dev/null)"
+echo "HOST_CONNTRACK_COUNT=$(cat /proc/sys/net/netfilter/nf_conntrack_count 2>/dev/null)"
+echo "HOST_BACKLOG=$(sysctl -n net.core.netdev_max_backlog 2>/dev/null)"
+echo "HOST_SOMAXCONN=$(sysctl -n net.core.somaxconn 2>/dev/null)"
+echo "HOST_AWG_MODULE=$(modinfo amneziawg 2>/dev/null | awk '/^version:/{print $2; exit}')"
+for c in $(docker ps -a --format '{{.Names}}' | grep -E '^amnezia-(awg|exit)' | sort); do
+  echo "CT_NAME=$c"
+  if docker ps --format '{{.Names}}' | grep -qx "$c"; then
+    echo "CT_RUNNING=1"
+    docker exec "$c" sh -c 'for p in net.core.rmem_max net.core.wmem_max net.ipv4.tcp_fastopen net.ipv4.tcp_mtu_probing; do echo "CTK_$p=$(sysctl -n $p 2>/dev/null)"; done; echo "CTK_nofile=$(ulimit -n)"' 2>/dev/null
+  else
+    echo "CT_RUNNING=0"
+  fi
+done
+"""
+        # A multi-line script has to go through run_sudo_script: `sudo <script>`
+        # only elevates its first line, so every `docker` call below would run
+        # unprivileged and the container list would silently come back empty.
+        out, err, code = self.ssh.run_sudo_script(script, timeout=60)
+        info = {'host': {}, 'containers': []}
+        if code != 0 or not out:
+            return info
+        current = None
+        for line in out.splitlines():
+            if '=' not in line:
+                continue
+            key, _, val = line.partition('=')
+            key, val = key.strip(), val.strip()
+            if key.startswith('HOST_'):
+                info['host'][key[5:].lower()] = val
+            elif key == 'CT_NAME':
+                current = {'name': val, 'running': False, 'ct': {}}
+                info['containers'].append(current)
+            elif key == 'CT_RUNNING' and current is not None:
+                current['running'] = val == '1'
+            elif key.startswith('CTK_') and current is not None:
+                current['ct'][key[4:]] = val
+        return info
+
+    def install_protocol(self, protocol_type, port=None, awg_params=None,
+                         mtu=None, dns=None, special_junk=None, dns6=None):
         """
         Full installation of AWG or AWG-Legacy protocol.
         Steps: install docker -> prepare host -> build container ->
                configure container -> run container -> setup firewall
+
+        mtu/dns end up in the generated client configs; special_junk is an
+        {'i1': ..., 'i5': ...} mapping overriding the generated I1-I5.
         """
         if port is None:
             port = AWG_DEFAULTS['port']
 
+        base_proto = self._base_protocol(protocol_type)
         if awg_params is None:
-            awg_params = generate_awg_params(use_ranges=(protocol_type in (self.AWG, self.AWG2)))
+            awg_params = generate_awg_params(
+                # AWG 2.0: ranged H1-H4 ("min-max"). AWG 3.1: fixed 1,2,3,4
+                # per the official docs (custom headers off, Header
+                # Protection hides the message type) - same as the native
+                # AmneziaVPN client generates.
+                use_ranges=(base_proto in (self.AWG, self.AWG2)),
+                awg3=(base_proto == self.AWG3),
+            )
+
+        if special_junk is not None:
+            # An explicit mapping replaces the generated set outright, so
+            # clearing I1 in the UI actually clears it.
+            for key in SPECIAL_JUNK_KEYS:
+                awg_params.pop(key, None)
+            awg_params.update(normalize_special_junk(special_junk))
+
+        mtu = str(mtu or AWG_DEFAULTS['mtu']).strip()
+        dns = (dns or '').strip() or self._default_dns()
 
         container_name = self._container_name(protocol_type)
         docker_image = self._docker_image(protocol_type)
@@ -320,8 +1014,51 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 2: Prepare host
         results.append("Preparing host...")
-        self.prepare_host(protocol_type)
+        docker_ipv6 = self.prepare_host(protocol_type)
         results.append("Host prepared")
+        if docker_ipv6 == 'pending':
+            results.append(
+                "! Docker IPv6 was enabled in /etc/docker/daemon.json, but Docker "
+                "was NOT restarted because other containers are running. Tunnels "
+                "stay IPv4-only until you run: systemctl restart docker"
+            )
+        elif docker_ipv6 == 'restarted':
+            results.append("Docker restarted to apply IPv6 config")
+
+        # Step 2.5: Kernel module (best effort, userspace fallback)
+        results.append("Checking amneziawg kernel module...")
+        km = self.setup_kernel_module()
+        if km.startswith('ok'):
+            detail = km.split(':', 1)[1].strip() if ':' in km else ''
+            results.append(f"Kernel module ready ({detail})" if detail else "Kernel module ready")
+        elif km.startswith('skipped'):
+            results.append(f"Kernel module skipped, userspace mode (amneziawg-go): {km.split(':', 1)[-1].strip()}")
+        else:
+            results.append(f"Kernel module failed, userspace mode (amneziawg-go): {km.split(':', 1)[-1].strip()}")
+
+        # Step 2.6: warn about sibling AWG containers whose image still carries
+        # awg-tools of another version than the host kernel module - such a
+        # pair fails setconf with EINVAL and the tunnel silently stays down
+        # (the new start.sh self-heals via userspace, but a stale image should
+        # be rebuilt by reinstalling that instance).
+        module_v = self._host_awg_module_version()
+        if module_v and base_proto in (self.AWG, self.AWG2, self.AWG3):
+            out, _, _ = self.ssh.run_sudo_command(
+                "docker ps --format '{{.Names}}' | grep -E '^amnezia-awg' || true"
+            )
+            for cname in out.split():
+                if cname == self._container_name(protocol_type):
+                    continue
+                tv, _, _ = self.ssh.run_sudo_command(
+                    f"docker exec {cname} sh -c \"awg --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1\" 2>/dev/null"
+                )
+                tools_v = tv.strip()
+                if tools_v and tools_v != module_v:
+                    results.append(
+                        f"! {cname}: awg-tools {tools_v} vs kernel module {module_v} mismatch - "
+                        f"the tunnel self-heals in userspace mode on restart, but reinstall "
+                        f"this instance to rebuild its image and keep the fast kernel datapath."
+                    )
 
         # Step 3: Remove old container if exists
         if self.check_protocol_installed(protocol_type):
@@ -330,24 +1067,21 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             results.append("Old container removed")
 
         # Step 4: Build/Pull container
+        if base_proto == self.AWG3:
+            module_version = self._host_awg_module_version()
+            if module_version and not self._module_supports_awg3(module_version):
+                results.append(
+                    f"! Host amneziawg kernel module {module_version} predates "
+                    f"AWG 3.1, the tunnel will run on userspace amneziawg-go "
+                    f"(slower). Upgrade the module to 3.1+ for the kernel "
+                    f"datapath."
+                )
         results.append("Pulling Docker image...")
         dockerfile_folder = f"/opt/amnezia/{container_name}"
 
-        # Create Dockerfile - matches original from client/server_scripts/awg/
-        dockerfile_content = (
-            f"FROM {docker_image}\n"
-            f"\n"
-            f'LABEL maintainer="AmneziaVPN"\n'
-            f"\n"
-            f"RUN apk add --no-cache bash curl dumb-init iptables\n"
-            f"RUN apk --update upgrade --no-cache\n"
-            f"\n"
-            f"RUN mkdir -p /opt/amnezia\n"
-            f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
-            f'echo "tail -f /dev/null" >> /opt/amnezia/start.sh\n'
-            f"RUN chmod a+x /opt/amnezia/start.sh\n"
-            f"\n"
-            f'ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]\n'
+        dockerfile_content = self._dockerfile_content(
+            docker_image,
+            AWG_QUICK_FORCE_USERSPACE_PATCH if base_proto in (self.AWG, self.AWG2, self.AWG3) else '',
         )
         self.ssh.run_sudo_command(f"mkdir -p {dockerfile_folder}")
         self.ssh.upload_file_sudo(dockerfile_content, f"{dockerfile_folder}/Dockerfile")
@@ -362,16 +1096,11 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 5: Run container
         results.append("Starting container...")
-        run_cmd = f"""docker run -d \
---restart always \
---privileged \
---cap-add=NET_ADMIN \
---cap-add=SYS_MODULE \
--p {port}:{port}/udp \
--v /lib/modules:/lib/modules \
---sysctl="net.ipv4.conf.all.src_valid_mark=1" \
---name {container_name} \
-{container_name}"""
+        # Detect host IPv6 BEFORE creating the container: the netns
+        # disable_ipv6 flags are fixed at container creation time, see
+        # _docker_run_cmd.
+        ipv6_enabled = self._detect_server_ipv6()
+        run_cmd = self._docker_run_cmd(container_name, container_name, port, ipv6_enabled)
 
         out, err, code = self.ssh.run_sudo_command(run_cmd)
         if code != 0:
@@ -387,12 +1116,20 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
 
         # Step 6: Configure container (generate server keys and config)
         results.append("Configuring AWG...")
-        self._configure_container(protocol_type, port, awg_params)
+        ipv6_enabled = self._detect_server_ipv6(protocol_type)
+        results.append(
+            "IPv6 works end-to-end, enabling dual-stack tunnel"
+            if ipv6_enabled else
+            "No usable IPv6 (host or Docker), tunnel will be IPv4-only"
+        )
+        self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled,
+                                  mtu=mtu, dns=dns, dns6=dns6)
         results.append("AWG configured")
 
         # Step 7: Upload and run start script
         results.append("Starting AWG service...")
-        self._upload_start_script(protocol_type, port, awg_params)
+        self._upload_start_script(protocol_type)
+        self._verify_interface_up(protocol_type)
         results.append("AWG service started")
 
         # Step 8: Setup firewall
@@ -400,11 +1137,18 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
         self.setup_firewall()
         results.append("Firewall configured")
 
+        # Step 9: Host network tuning (BBR)
+        results.append("Applying host network tuning (BBR)...")
+        self.setup_host_tuning()
+        results.append("Host network tuning applied")
+
         return {
             'status': 'success',
             'protocol': protocol_type,
             'port': port,
             'awg_params': awg_params,
+            'mtu': mtu,
+            'dns': dns,
             'log': results,
         }
 
@@ -433,17 +1177,49 @@ iptables -C FORWARD -j DOCKER-USER 2>/dev/null || iptables -A FORWARD -j DOCKER-
             f"(status: {last_status}). Logs:\n{logs_out}"
         )
 
-    def _configure_container(self, protocol_type, port, awg_params):
+    def _configure_container(self, protocol_type, port, awg_params, ipv6=False,
+                             mtu=None, dns=None, dns6=None):
         """Configure the AWG container (generate keys and server config)."""
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._config_path(protocol_type)
 
-        subnet_ip = AWG_DEFAULTS['subnet_ip']
-        subnet_cidr = AWG_DEFAULTS['subnet_cidr']
+        subnet_ip = self._get_subnet_ip(protocol_type)
+        subnet_cidr = self._get_subnet_cidr(protocol_type)
+
+        # AWG 3.1 parameters are written only when the protocol asks for them,
+        # so awg/awg2 installations keep byte-identical configs.
+        awg3_config_lines = ''.join(
+            f"{config_key} = {awg_params[param_key]}\n"
+            for param_key, config_key in AWG3_PARAM_MAP
+            if awg_params.get(param_key)
+        )
+
+        special_junk_lines = ''.join(
+            f"{param_key.upper()} = {awg_params[param_key]}\n"
+            for param_key in SPECIAL_JUNK_KEYS
+            if awg_params.get(param_key)
+        )
+
+        # MTU and DNS belong to the generated client configs, not to the
+        # server interface, so they are stored as comments: awg-quick would
+        # otherwise resize the server tunnel and call resolvconf, which the
+        # container does not have. _get_mtu/_get_dns read them back.
+        client_defaults_lines = (
+            f"# MTU = {mtu or AWG_DEFAULTS['mtu']}\n"
+            f"# DNS = {dns or self._default_dns()}\n"
+        )
+        # IPv6 DNS for dual-stack tunnels, stored the same comment way;
+        # _get_dns6 reads it back when building client configs.
+        if ipv6:
+            client_defaults_lines += f"# DNS6 = {AWG_DEFAULTS['dns6']}\n"
+
+        address_line = f"{subnet_ip}/{subnet_cidr}"
+        if ipv6:
+            address_line += f", {AWG_DEFAULTS['subnet_ipv6_ip']}/{AWG_DEFAULTS['subnet_ipv6_cidr']}"
 
         # Build the server config generation script
-        if protocol_type in (self.AWG, self.AWG2):
+        if self._base_protocol(protocol_type) in (self.AWG, self.AWG2, self.AWG3):
             config_script = f"""
 mkdir -p /opt/amnezia/awg
 cd /opt/amnezia/awg
@@ -459,7 +1235,7 @@ echo $WIREGUARD_PSK > /opt/amnezia/awg/wireguard_psk.key
 cat > {config_path} <<EOF
 [Interface]
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
-Address = {subnet_ip}/{subnet_cidr}
+Address = {address_line}
 ListenPort = {port}
 Jc = {awg_params['junk_packet_count']}
 Jmin = {awg_params['junk_packet_min_size']}
@@ -472,14 +1248,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-# Signature Chain parameters (AWG 2.0+)
-# I1 = 0
-# I2 = 0
-# I3 = 0
-# I4 = 0
-# I5 = 0
-# CPS = signature
-EOF
+{special_junk_lines}{awg3_config_lines}{client_defaults_lines}EOF
 """
         else:
             # AWG Legacy uses wg commands
@@ -498,7 +1267,7 @@ echo $WIREGUARD_PSK > /opt/amnezia/awg/wireguard_psk.key
 cat > {config_path} <<EOF
 [Interface]
 PrivateKey = $WIREGUARD_SERVER_PRIVATE_KEY
-Address = {subnet_ip}/{subnet_cidr}
+Address = {address_line}
 ListenPort = {port}
 Jc = {awg_params['junk_packet_count']}
 Jmin = {awg_params['junk_packet_min_size']}
@@ -509,7 +1278,7 @@ H1 = {awg_params['init_packet_magic_header']}
 H2 = {awg_params['response_packet_magic_header']}
 H3 = {awg_params['underload_packet_magic_header']}
 H4 = {awg_params['transport_packet_magic_header']}
-EOF
+{client_defaults_lines}EOF
 """
 
         out, err, code = self.ssh.run_sudo_command(
@@ -518,235 +1287,562 @@ EOF
         if code != 0:
             raise RuntimeError(f"Failed to configure container: {err}")
 
-    def _build_start_script(self, protocol_type, network, listen_port=None, redirect_ports=None):
-        """Render the container start.sh for the given client-address pool.
+    # ===================== CONTAINER BUILDERS =====================
+    # Pure string builders (no SSH), pinned by golden fixtures in
+    # tests/test_awg_start_script.py so the generated container files can be
+    # changed deliberately, never by accident.
 
-        ``network`` drives the FORWARD/MASQUERADE source so the NAT covers the
-        whole pool (a wider /16 instead of the legacy /24).
+    @staticmethod
+    def _dockerfile_content(docker_image, userspace_patch):
+        """Dockerfile of a protocol container - matches the original from
+        client/server_scripts/awg/. `userspace_patch` is the awg-quick sed
+        patch for AWG images or '' for the legacy one (it runs wg-quick
+        against the plain WireGuard module, which has nothing to fall back
+        to)."""
+        return (
+            f"FROM {docker_image}\n"
+            f"\n"
+            f'LABEL maintainer="AmneziaVPN"\n'
+            f"\n"
+            f"RUN apk add --no-cache bash curl dumb-init iptables iproute2 conntrack-tools\n"
+            f"RUN apk --update upgrade --no-cache\n"
+            f"\n"
+            f"{userspace_patch}"
+            f"\n"
+            f"RUN mkdir -p /opt/amnezia\n"
+            f'RUN echo "#!/bin/bash" > /opt/amnezia/start.sh && '
+            f'echo "sysctl -p /etc/sysctl.conf 2>/dev/null || true" >> /opt/amnezia/start.sh && '
+            f'echo "tail -f /dev/null" >> /opt/amnezia/start.sh\n'
+            f"RUN chmod a+x /opt/amnezia/start.sh\n"
+            f"\n"
+            f"# Network tuning (mirrors AmneziaVPN container tuning)\n"
+            f"RUN printf '%s\\n' \\\n"
+            f"'fs.file-max = 51200' \\\n"
+            f"'net.core.rmem_max = 67108864' \\\n"
+            f"'net.core.wmem_max = 67108864' \\\n"
+            f"'net.core.netdev_max_backlog = 250000' \\\n"
+            f"'net.core.somaxconn = 4096' \\\n"
+            f"'net.ipv4.tcp_syncookies = 1' \\\n"
+            f"'net.ipv4.tcp_tw_reuse = 1' \\\n"
+            f"'net.ipv4.tcp_fin_timeout = 30' \\\n"
+            f"'net.ipv4.tcp_keepalive_time = 1200' \\\n"
+            f"'net.ipv4.ip_local_port_range = 10000 65000' \\\n"
+            f"'net.ipv4.tcp_max_syn_backlog = 8192' \\\n"
+            f"'net.ipv4.tcp_max_tw_buckets = 5000' \\\n"
+            f"'net.ipv4.tcp_fastopen = 3' \\\n"
+            f"'net.ipv4.tcp_mem = 25600 51200 102400' \\\n"
+            f"'net.ipv4.tcp_rmem = 4096 87380 67108864' \\\n"
+            f"'net.ipv4.tcp_wmem = 4096 65536 67108864' \\\n"
+            f"'net.ipv4.tcp_mtu_probing = 1' \\\n"
+            f" >> /etc/sysctl.conf && \\\n"
+            f"mkdir -p /etc/security && \\\n"
+            f"printf '%s\\n' '* soft nofile 51200' '* hard nofile 51200' >> /etc/security/limits.conf\n"
+            f"\n"
+            f'ENTRYPOINT [ "dumb-init", "/opt/amnezia/start.sh" ]\n'
+        )
 
-        ``redirect_ports`` (+ ``listen_port``) bake in-container DNAT so that
-        every published "alternative" UDP port is funnelled to the single wg
-        ListenPort. This is how we advertise a new port to clients while keeping
-        old ports working: wg never moves, the extra ports just redirect to it.
+    @staticmethod
+    def _docker_run_cmd(container_name, image, port, ipv6_enabled):
+        """`docker run` command line of a protocol container.
+
+        The IPv6 sysctls have to be passed at creation time: the netns
+        disable_ipv6 flags are fixed then, so a container started without
+        them can never add an IPv6 address to a tunnel interface (ip -6
+        address add -> RTNETLINK Permission denied, and awg-quick then
+        deletes the whole awg0).
         """
-        quick_bin = self._quick_binary(protocol_type)
-        config_path = self._config_path(protocol_type)
-        src = str(network)
+        ipv6_sysctls = (
+            '--sysctl="net.ipv6.conf.all.disable_ipv6=0" \\\n'
+            '--sysctl="net.ipv6.conf.default.disable_ipv6=0" \\\n'
+            if ipv6_enabled else ''
+        )
+        return f"""docker run -d \
+--restart always \
+--privileged \
+--cap-add=NET_ADMIN \
+--cap-add=SYS_MODULE \
+-p {port}:{port}/udp \
+-v /lib/modules:/lib/modules \
+--sysctl="net.ipv4.conf.all.src_valid_mark=1" \
+{ipv6_sysctls} --name {container_name} \
+--ulimit nofile=51200:51200 \
+{image}"""
 
-        redirect_block = ""
-        if listen_port and redirect_ports:
-            lines = [
-                f"iptables -t nat -A PREROUTING -p udp --dport {int(p)} -j REDIRECT --to-ports {int(listen_port)}"
-                for p in redirect_ports
-                if int(p) != int(listen_port)
-            ]
-            if lines:
-                redirect_block = (
-                    "\n# Funnel alternative/legacy public ports to the wg ListenPort\n"
-                    "# (lets new configs use a new port while old ports keep working)\n"
-                    + "\n".join(lines)
-                    + "\n"
-                )
+    @staticmethod
+    def _mss_clamp_body(iface):
+        """Clamp TCP MSS on a transit link in both directions, so a tunnel
+        carried inside another tunnel never depends on PMTU discovery."""
+        return (
+            f"# Clamp TCP MSS on the transit link so entry->exit->internet never needs fragmentation\n"
+            f"iptables -t mangle -A FORWARD -i {iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+            f"iptables -t mangle -A FORWARD -o {iface} -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true\n"
+        )
 
+    @staticmethod
+    def _start_script_body(config_path, quick_bin, userspace_guard, subnet_default, bwlimits_path,
+                           extra_blocks=(), pre_blocks=()):
+        """/opt/amnezia/start.sh of a protocol container: brings the tunnel
+        up, sets up forwarding/NAT and applies per-peer bandwidth limits.
+        `pre_blocks` go in before the tunnel comes up (the exit-node
+        kill-switch must exist before awg0 can forward anything),
+        `extra_blocks` are appended verbatim before the final `tail -f`."""
+        pre = ''.join(f"{block}\n" for block in pre_blocks)
+        extra = ''.join(f"{block}\n" for block in extra_blocks)
         return f"""#!/bin/bash
 echo "Container startup"
 
+# Apply container network tuning (see Dockerfile)
+sysctl -p /etc/sysctl.conf 2>/dev/null || true
+
+# Read subnet from server config dynamically (IPv4 part of the Address line)
+SUBNET=$(grep '^Address' {config_path} | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
+if [ -z "$SUBNET" ]; then
+  SUBNET={subnet_default}
+fi
+
+# IPv6 subnet, if the tunnel is dual-stack (second part of the Address line)
+SUBNET6=$(grep '^Address' {config_path} | head -1 | tr ',' '\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
+{pre}{userspace_guard}
 # kill daemons in case of restart
 {quick_bin} down {config_path} 2>/dev/null
 
+IFACE=$(basename {config_path} .conf)
+
 # start daemons if configured
-if [ -f {config_path} ]; then {quick_bin} up {config_path}; fi
+if [ -f {config_path} ]; then
+  {quick_bin} up {config_path}
+  # Self-heal: when awg-tools and the host kernel module disagree on the
+  # version (e.g. module upgraded to 3.1 while the image still carries old
+  # tools), setconf fails with EINVAL and the tunnel silently stays down.
+  # Detect the mismatch and retry in userspace mode (amneziawg-go) - slower,
+  # but the clients keep their internet.
+  if ! ip link show "$IFACE" >/dev/null 2>&1; then
+    TOOLS_V=$(awg --version 2>/dev/null | grep -oE '[0-9]+\\.[0-9]+\\.[0-9]+' | head -1)
+    MOD_V=$(cat /sys/module/amneziawg/version 2>/dev/null || true)
+    if [ -n "$MOD_V" ] && [ -n "$TOOLS_V" ] && [ "$TOOLS_V" != "$MOD_V" ]; then
+      echo "! awg-tools $TOOLS_V vs kernel module $MOD_V mismatch"
+      if grep -q WG_FORCE_USERSPACE "$(command -v {quick_bin})" 2>/dev/null; then
+        echo "! retrying in userspace mode (amneziawg-go)"
+        WG_FORCE_USERSPACE=1 {quick_bin} up {config_path}
+      fi
+    fi
+  fi
+fi
 
 # Allow traffic on the TUN interface
-IFACE=$(basename {config_path} .conf)
 iptables -A INPUT -i $IFACE -j ACCEPT
 iptables -A FORWARD -i $IFACE -j ACCEPT
 iptables -A OUTPUT -o $IFACE -j ACCEPT
 
 # Allow forwarding traffic only from the VPN
-iptables -A FORWARD -i $IFACE -o eth0 -s {src} -j ACCEPT
-iptables -A FORWARD -i $IFACE -o eth1 -s {src} -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth0 -s $SUBNET -j ACCEPT
+iptables -A FORWARD -i $IFACE -o eth1 -s $SUBNET -j ACCEPT
 
 iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
 
-iptables -t nat -A POSTROUTING -s {src} -o eth0 -j MASQUERADE
-iptables -t nat -A POSTROUTING -s {src} -o eth1 -j MASQUERADE
-{redirect_block}
-tail -f /dev/null
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth0 -j MASQUERADE
+iptables -t nat -A POSTROUTING -s $SUBNET -o eth1 -j MASQUERADE
+
+# IPv6 forwarding + NAT66, only when the tunnel has an IPv6 subnet
+if [ -n "$SUBNET6" ] && command -v ip6tables >/dev/null 2>&1; then
+  sysctl -w net.ipv6.conf.all.forwarding=1 2>/dev/null || true
+  ip6tables -A INPUT -i $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -j ACCEPT
+  ip6tables -A OUTPUT -o $IFACE -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth0 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -i $IFACE -o eth1 -s $SUBNET6 -j ACCEPT
+  ip6tables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth0 -j MASQUERADE
+  ip6tables -t nat -A POSTROUTING -s $SUBNET6 -o eth1 -j MASQUERADE
+fi
+
+# Apply per-peer bandwidth limits (flat file written by the panel)
+if [ -f {bwlimits_path} ]; then
+(
+{AWGManager._tc_apply_body(bwlimits_path, config_path)}
+)
+fi
+
+{extra}tail -f /dev/null
 """
 
-    def _ensure_subnet_nat(self, protocol_type, network):
-        """Make sure NAT masquerade covers ``network`` on a running container.
+    def _render_start_script(self, protocol_type, config_path=None):
+        """start.sh for one protocol instance. `config_path` overrides the
+        default location - save_server_config passes the resolved path of an
+        existing container. The exit-node block is always emitted: it is
+        inert without exit0.conf and makes the container restart-safe for a
+        link written later."""
+        config_path = config_path or self._config_path(protocol_type)
+        quick_bin = self._quick_binary(protocol_type)
+        subnet_default = f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}"
+        functions = self._exit_shell_functions(config_path, quick_bin, subnet_default)
+        return self._start_script_body(
+            config_path,
+            quick_bin,
+            self._userspace_guard(protocol_type),
+            subnet_default,
+            self._bwlimits_path(),
+            pre_blocks=(functions + '[ -f "$EXIT_CONF" ] && x_killswitch_on\n',),
+            extra_blocks=('# ---- Exit-node link: bring it up now that the client tunnel exists ----\n'
+                          'if [ -f "$EXIT_CONF" ]; then x_link_up || echo "! exit link not applied, clients stay on the kill-switch"; fi\n',),
+        )
 
-        Applied live over SSH (no restart, no session drop) and persisted into
-        start.sh so it survives future restarts. Idempotent — safe to call on
-        every client op. This is what lets already-deployed /24 nodes serve the
-        widened /16 pool without anyone hand-editing iptables on each host: the
-        first client op that needs the wider subnet installs the rule.
-        """
+    def _write_start_script(self, protocol_type, config_path=None):
+        """Put a freshly rendered start.sh into the container (no restart)."""
         container_name = self._container_name(protocol_type)
-        src = str(network)
-        try:
-            # Live, idempotent masquerade for both common egress interfaces.
-            live = " ; ".join(
-                f"iptables -t nat -C POSTROUTING -s {src} -o {iface} -j MASQUERADE 2>/dev/null || "
-                f"iptables -t nat -A POSTROUTING -s {src} -o {iface} -j MASQUERADE"
-                for iface in ("eth0", "eth1")
-            )
-            self.ssh.run_sudo_command(
-                f"docker exec -i {container_name} bash -c '{live}'"
-            )
-
-            # Persist into start.sh only if the subnet isn't already baked in.
-            _, _, code = self.ssh.run_sudo_command(
-                f"docker exec -i {container_name} bash -c \"grep -q '{src}' /opt/amnezia/start.sh 2>/dev/null\""
-            )
-            if code != 0:
-                # Preserve any configured port redirects (advertised/legacy
-                # ports) so widening NAT doesn't wipe them out.
-                listen_port = self._current_listen_port(protocol_type)
-                redirect_ports = sorted(
-                    self._current_published_ports(protocol_type) - {listen_port}
-                )
-                start_script = self._build_start_script(
-                    protocol_type, network,
-                    listen_port=listen_port, redirect_ports=redirect_ports,
-                )
-                self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
-                self.ssh.run_sudo_command(
-                    f"docker cp /tmp/_amnz_start.sh {container_name}:/opt/amnezia/start.sh"
-                )
-                self.ssh.run_sudo_command(
-                    f"docker exec {container_name} chmod +x /opt/amnezia/start.sh"
-                )
-                self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
-        except Exception:
-            # NAT widening is best-effort; don't block client ops if it fails
-            # (legacy /24 clients keep working off the existing rule).
-            logger.exception("Failed to ensure NAT for subnet %s on %s", src, container_name)
-
-        # NAT covers only the *egress* half. Legacy /24 nodes also need the
-        # tunnel interface's on-link subnet widened to the pool, or the kernel
-        # has no route back to awg0 for replies destined to live-added peers
-        # outside the /24 (added via `wg syncconf`, which writes no route). The
-        # client then connects and uploads but receives nothing. Same per-client
-        # auto-heal trigger as the NAT widening above.
-        self._ensure_tunnel_onlink(protocol_type, network)
-
-    def _server_address(self, protocol_type):
-        """Return ``(ip, prefixlen)`` of the server's [Interface] Address, or
-        ``(None, None)`` if it can't be read/parsed."""
-        try:
-            config = self._get_server_config(protocol_type)
-        except Exception:
-            return None, None
-        for line in config.split('\n'):
-            s = line.strip()
-            if s.startswith('Address'):
-                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', s)
-                if m:
-                    return m.group(1), int(m.group(2))
-        return None, None
-
-    def _apply_onlink_widen(self, protocol_type, ip_self, cur_prefix, target_prefix, network):
-        """Widen the tunnel interface's on-link subnet from ``ip_self/cur_prefix``
-        to ``ip_self/target_prefix`` — persistently (rewrites the server config so
-        a container restart / ``awg-quick up`` keeps the wide subnet) and live
-        (no restart, no session drop)."""
-        container = self._container_name(protocol_type)
-        config_path = self._resolve_config_path(protocol_type)
-        iface = self._interface_name(protocol_type, config_path)
-        want = f"{ip_self}/{target_prefix}"
-
-        # (a) Persist into the server config. Without this the fix is lost on the
-        #     next restart (awg-quick re-reads the narrow Address), so the live
-        #     swap below would only ever be a temporary patch.
-        config = self._get_server_config(protocol_type)
-        new_config = re.sub(
-            rf"(?m)^([ \t]*Address[ \t]*=[ \t]*){re.escape(ip_self)}/{cur_prefix}\b",
-            rf"\g<1>{want}",
-            config,
-        )
-        if new_config != config:
-            self.ssh.upload_file(new_config, "/tmp/_amnz_onlink.conf")
-            self.ssh.run_sudo_command(
-                f"docker cp /tmp/_amnz_onlink.conf {container}:{config_path}"
-            )
-            self.ssh.run_command("rm -f /tmp/_amnz_onlink.conf")
-
-        # (b) Apply live: add the wide address, CONFIRM it is on the interface,
-        #     only then drop the narrow one. Add-before-del leaves no window
-        #     without an address, and the guard means a failed add never strips
-        #     the only address off the live tunnel.
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container} ip addr add {want} dev {iface}"
-        )
-        out, _, _ = self.ssh.run_sudo_command(
-            f"docker exec -i {container} ip -o -4 addr show dev {iface}"
-        )
-        if want in out:
-            self.ssh.run_sudo_command(
-                f"docker exec -i {container} ip addr del {ip_self}/{cur_prefix} dev {iface}"
-            )
-        logger.warning(
-            "Widened AWG tunnel on-link %s/%s -> %s on %s (%s)",
-            ip_self, cur_prefix, want, container, protocol_type,
-        )
-
-    def _ensure_tunnel_onlink(self, protocol_type, network):
-        """Best-effort per-client auto-heal: widen the tunnel on-link subnet to
-        ``network`` if the interface is still on a narrower prefix. Idempotent;
-        only ever widens (smaller prefix), never narrows."""
-        try:
-            ip_self, cur = self._server_address(protocol_type)
-            if ip_self and cur is not None and cur > network.prefixlen:
-                self._apply_onlink_widen(
-                    protocol_type, ip_self, cur, network.prefixlen, network
-                )
-        except Exception:
-            container = self._container_name(protocol_type)
-            logger.exception(
-                "Failed to widen tunnel on-link on %s (%s)", container, protocol_type
-            )
-
-    def heal_tunnel_onlink(self, protocol_type, apply=True):
-        """Detect (and optionally fix) a too-narrow on-link subnet on the tunnel
-        interface — the maintenance-script entrypoint (explicit reporting).
-
-        Returns a dict::
-
-            {'status': 'noop'|'widen'|'widened'|'unknown',
-             'ip': <server tunnel ip>, 'from': <cur prefix>, 'to': <target prefix>}
-
-        ``apply=False`` only reports (dry-run); ``apply=True`` widens in place."""
-        network = self._get_subnet(protocol_type)
-        ip_self, cur = self._server_address(protocol_type)
-        target = network.prefixlen
-        if not ip_self or cur is None:
-            return {'status': 'unknown'}
-        if cur <= target:
-            return {'status': 'noop', 'ip': ip_self, 'from': cur, 'to': cur}
-        result = {'status': 'widen', 'ip': ip_self, 'from': cur, 'to': target}
-        if apply:
-            self._apply_onlink_widen(protocol_type, ip_self, cur, target, network)
-            result['status'] = 'widened'
-        return result
-
-    def _upload_start_script(self, protocol_type, port, awg_params):
-        """Upload and execute the start script inside the container."""
-        container_name = self._container_name(protocol_type)
-        start_script = self._build_start_script(protocol_type, self._default_network())
-
-        # Upload start script to container via SFTP + docker cp
-        self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
+        self.ssh.upload_file(self._with_port_redirects(self._render_start_script(protocol_type, config_path), protocol_type), "/tmp/_amnz_start.sh")
         self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_start.sh {container_name}:/opt/amnezia/start.sh")
         self.ssh.run_sudo_command(f"docker exec {container_name} chmod +x /opt/amnezia/start.sh")
         self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
 
-        # Restart to apply the start script
-        self.ssh.run_sudo_command(f"docker restart {container_name}")
-        import time
+    def _upload_start_script(self, protocol_type):
+        """Write the start script and restart the container to run it."""
+        self._write_start_script(protocol_type)
+        self.ssh.run_sudo_command(f"docker restart {self._container_name(protocol_type)}")
         time.sleep(5)
+
+    # ===================== EXIT-NODE LINK (ENTRY SIDE) =====================
+
+    _EXIT_SHELL_TEMPLATE = """# ---- Exit-node link (panel-managed; driven by __EXIT_CONF__) ----
+EXIT_CONF=__EXIT_CONF__
+EXIT_IF=__EXIT_IF__
+EXIT_TABLE=__EXIT_TABLE__
+EXIT_PREF=__EXIT_TABLE__      # slot 0: 190/191 exceptions, catch-all at the table number
+DNS_NET=__DNS_NET__
+X_CONF=__CONF__
+X_QUICK=__QUICK__
+X_IFACE=$(basename $X_CONF .conf)
+X_SUBNET=$(grep '^Address' $X_CONF | head -1 | cut -d'=' -f2 | cut -d',' -f1 | tr -d ' ')
+[ -n "$X_SUBNET" ] || X_SUBNET=__SUBNET_DEFAULT__
+X_SUBNET6=$(grep '^Address' $X_CONF | head -1 | tr ',' '\\n' | grep ':' | sed 's/^[^=]*=//' | tr -d ' ' | head -1)
+
+x_rule()    { ip "$1" rule show 2>/dev/null | grep -q "^$2:" || ip "$1" rule add pref "$2" "${@:3}"; }
+x_unrule()  { while ip "$1" rule del pref "$2" 2>/dev/null; do :; done; }
+x_ipt_add() { iptables -t "$1" -C "${@:2}" 2>/dev/null || iptables -t "$1" -A "${@:2}"; }
+x_ipt_del() { while iptables -t "$1" -D "${@:2}" 2>/dev/null; do :; done; }
+
+x_killswitch_on() {
+  # Everything from the client subnet is answered by the exit table. Until
+  # exit0 is up that table holds only a blackhole, so nothing falls through
+  # to eth0 - this runs before the client tunnel comes up on purpose.
+  ip -4 route replace blackhole default metric 1000 table $EXIT_TABLE
+  x_rule -4 190 from $X_SUBNET to $X_SUBNET lookup main
+  if grep -qs '^# DnsViaExit = on' "$EXIT_CONF"; then x_unrule -4 191
+  else x_rule -4 191 from $X_SUBNET to $DNS_NET lookup main; fi
+  x_rule -4 $EXIT_PREF from $X_SUBNET lookup $EXIT_TABLE
+  if [ -n "$X_SUBNET6" ]; then
+    # No IPv6 path through the exit yet: refuse fast instead of leaking via eth0
+    ip -6 route replace unreachable default table $EXIT_TABLE
+    x_rule -6 190 from $X_SUBNET6 to $X_SUBNET6 lookup main
+    x_rule -6 $EXIT_PREF from $X_SUBNET6 lookup $EXIT_TABLE
+  fi
+}
+x_killswitch_off() {
+  for p in 190 191 $EXIT_PREF; do x_unrule -4 $p; x_unrule -6 $p; done
+  ip -4 route flush table $EXIT_TABLE 2>/dev/null
+  ip -6 route flush table $EXIT_TABLE 2>/dev/null
+}
+x_link_up() {
+  $X_QUICK down $EXIT_CONF 2>/dev/null
+  if ! $X_QUICK up $EXIT_CONF; then
+    echo "! $EXIT_IF failed to start; clients stay on the kill-switch until the link is repaired or removed"
+    return 3
+  fi
+  # Loose reverse-path check on the link only: containers inherit rp_filter
+  # from the host, and per-client exit tables (later) can make the reverse
+  # lookup resolve to another exitN.
+  sysctl -w net.ipv4.conf.$EXIT_IF.rp_filter=2 >/dev/null 2>&1 || true
+  ip -4 route replace default dev $EXIT_IF table $EXIT_TABLE
+  x_ipt_add filter FORWARD -i $X_IFACE -o $EXIT_IF -s $X_SUBNET -j ACCEPT
+  # SNAT clients into this node's transit address: the exit sees one /32 per entry
+  x_ipt_add nat POSTROUTING -s $X_SUBNET -o $EXIT_IF -j MASQUERADE
+  x_ipt_add mangle FORWARD -o $EXIT_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  x_ipt_add mangle FORWARD -i $EXIT_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu 2>/dev/null || true
+  # NAT is decided once per flow: flows opened before the link were SNATed to
+  # eth0 and would leave exit0 with the wrong source. Drop them so they reopen.
+  if command -v conntrack >/dev/null 2>&1; then conntrack -D -s $X_SUBNET >/dev/null 2>&1
+  else echo "! conntrack-tools missing: client flows opened before the link keep leaving via eth0 until they end"; fi
+  # Never report success while clients could still leave via eth0
+  if ! ip -4 rule show | grep -q "^$EXIT_PREF:" \\
+     || ! ip -4 route show table $EXIT_TABLE | grep -q "^default dev $EXIT_IF" \\
+     || ! iptables -t nat -C POSTROUTING -s $X_SUBNET -o $EXIT_IF -j MASQUERADE 2>/dev/null; then
+    echo "! FATAL: policy routing for $EXIT_IF is not in place"
+    return 3
+  fi
+  echo "exit link up: $(ip -4 -o addr show dev $EXIT_IF | awk '{print $4}') -> table $EXIT_TABLE"
+}
+x_link_down() {
+  # Take the interface down first: MASQUERADE forgets the flows NATed through
+  # it (device notifier) and the table keeps blackholing until the rules go.
+  [ -f "$EXIT_CONF" ] && $X_QUICK down $EXIT_CONF 2>/dev/null
+  ip link del $EXIT_IF 2>/dev/null
+  x_ipt_del filter FORWARD -i $X_IFACE -o $EXIT_IF -s $X_SUBNET -j ACCEPT
+  x_ipt_del nat POSTROUTING -s $X_SUBNET -o $EXIT_IF -j MASQUERADE
+  x_ipt_del mangle FORWARD -o $EXIT_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+  x_ipt_del mangle FORWARD -i $EXIT_IF -p tcp --tcp-flags SYN,RST SYN -j TCPMSS --clamp-mss-to-pmtu
+}
+x_exit_sync() {
+  if [ -f "$EXIT_CONF" ]; then x_killswitch_on && x_link_up
+  else x_link_down; x_killswitch_off; fi
+}
+"""
+
+    @staticmethod
+    def _exit_shell_functions(config_path, quick_bin, subnet_default):
+        """Shell functions of the entry side of an exit-node link (no
+        side effects by themselves): kill-switch, link up/down and the sync
+        entry point used both by start.sh and by the live apply."""
+        return (AWGManager._EXIT_SHELL_TEMPLATE
+                .replace('__EXIT_CONF__', EXIT_CONF)
+                .replace('__EXIT_IF__', EXIT_IFACE)
+                .replace('__EXIT_TABLE__', str(EXIT_TABLE))
+                .replace('__DNS_NET__', DNS_NET)
+                .replace('__CONF__', config_path)
+                .replace('__QUICK__', quick_bin)
+                .replace('__SUBNET_DEFAULT__', subnet_default))
+
+    @staticmethod
+    def _exit_conf_body(link):
+        """exit0.conf of the entry side. The private key is substituted
+        inside the container (it never leaves it); `Table = off` keeps
+        awg-quick from touching the routing - the shell block owns it."""
+        lines = [
+            '[Interface]',
+            '# Managed by Amnezia Web Panel - exit node link',
+            f"# ExitUid = {link.get('exit_uid', '')}",
+            f"# ExitName = {link.get('exit_name', '')}",
+            f"# Obfuscation = {'on' if link.get('obfuscation') else 'off'}",
+            f"# DnsViaExit = {'on' if link.get('dns_via_exit') else 'off'}",
+            f"PrivateKey = {ENTRY_PRIVATE_KEY_PLACEHOLDER}",
+            f"Address = {link['transit_ip']}/{link.get('subnet_cidr', 24)}",
+            f"MTU = {EXIT_MTU}",
+            'Table = off',
+        ]
+        if link.get('obfuscation'):
+            params = link.get('awg_params') or {}
+            lines += [f"{config_key} = {params[param_key]}"
+                      for param_key, config_key in TRANSIT_PARAM_KEYS if params.get(param_key)]
+        lines += [
+            '',
+            '[Peer]',
+            f"PublicKey = {link['exit_public_key']}",
+            f"PresharedKey = {link['psk']}",
+            'AllowedIPs = 0.0.0.0/0',
+            f"Endpoint = {link['endpoint_host']}:{link['endpoint_port']}",
+            'PersistentKeepalive = 25',
+        ]
+        return '\n'.join(lines) + '\n'
+
+    def exit_prepare_keys(self, protocol_type):
+        """Create the entry-side key pair inside the container (kept if it
+        exists) and return the public key."""
+        container_name = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} bash -c 'umask 077; mkdir -p {EXIT_DIR}; "
+            f"[ -s {EXIT_KEY} ] || {wg_bin} genkey > {EXIT_KEY}; {wg_bin} pubkey < {EXIT_KEY}'"
+        )
+        if code != 0 or not out.strip():
+            raise RuntimeError(f"Failed to prepare the exit link key: {err or out}")
+        return out.strip()
+
+    def _exit_apply(self, protocol_type, teardown=False):
+        """Run the exit block live inside the container (same snippet as in
+        start.sh). Raises when the link could not be brought up, so a caller
+        never records a link whose clients would still leave via eth0."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        functions = self._exit_shell_functions(
+            config_path, self._quick_binary(protocol_type),
+            f"{AWG_DEFAULTS['subnet_ip']}/{AWG_DEFAULTS['subnet_cidr']}")
+        action = ('x_link_down\nx_killswitch_off\nrm -f "$EXIT_CONF"\n' if teardown
+                  else 'x_exit_sync\n')
+        # One docker step per sudo call: the sudo prefix covers only the first
+        # command of a `&&` chain, the rest would run unprivileged.
+        self.ssh.upload_file(functions + action, "/tmp/_amnz_exit.sh")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_exit.sh {container_name}:/tmp/_amnz_exit.sh")
+        if code != 0:
+            self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
+            raise RuntimeError(f"exit link apply failed: {err or out or f'SSH exit code {code}'}")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec {container_name} bash /tmp/_amnz_exit.sh", timeout=60)
+        self.ssh.run_command("rm -f /tmp/_amnz_exit.sh")
+        if code != 0:
+            raise RuntimeError(f"exit link apply failed: {out or err or f'SSH exit code {code}'}")
+        return out
+
+    def exit_link(self, protocol_type, link):
+        """Write exit0.conf into the container, refresh start.sh (no restart)
+        and bring the link up live. `link` carries transit_ip, subnet_cidr,
+        exit_public_key, psk, endpoint_host, endpoint_port, obfuscation,
+        awg_params, exit_uid, exit_name, dns_via_exit."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(self._exit_conf_body(link), "/tmp/_amnz_exit0.conf")
+        # One docker step per sudo call (the sudo prefix covers only the first
+        # command of a `&&` chain).
+        steps = (
+            f"docker exec -i {container_name} mkdir -p {EXIT_DIR}",
+            f"docker cp /tmp/_amnz_exit0.conf {container_name}:{EXIT_CONF}",
+            f"docker exec -i {container_name} bash -c 'k=$(cat {EXIT_KEY}) && "
+            f"sed -i \"s|{ENTRY_PRIVATE_KEY_PLACEHOLDER}|$k|\" {EXIT_CONF} && chmod 600 {EXIT_CONF}'",
+        )
+        try:
+            for step in steps:
+                out, err, code = self.ssh.run_sudo_command(step)
+                if code != 0:
+                    raise RuntimeError(f"Failed to write exit0.conf: {err or out or f'SSH exit code {code}'}")
+        finally:
+            self.ssh.run_command("rm -f /tmp/_amnz_exit0.conf")
+        # Resolved path: an older legacy install may keep its config at awg0.conf.
+        self._write_start_script(protocol_type, config_path=self._resolve_config_path(protocol_type))
+        return self._exit_apply(protocol_type)
+
+    def exit_set_dns_via_exit(self, protocol_type, enabled):
+        """Flip the DnsViaExit marker in exit0.conf and re-apply the block.
+        With it on, the exception that keeps client DNS on this node is not
+        installed, so DNS queries follow the client subnet through the link
+        and are answered by the AmneziaDNS of the exit node. Re-applying
+        recreates exit0, so flows opened before the change reopen."""
+        container_name = self._container_name(protocol_type)
+        value = 'on' if enabled else 'off'
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c 'test -f {EXIT_CONF} || exit 9; "
+            f"sed -i \"s|^# DnsViaExit = .*|# DnsViaExit = {value}|\" {EXIT_CONF}'")
+        if code == 9:
+            raise RuntimeError('This instance has no exit link file')
+        if code != 0:
+            raise RuntimeError(f"Failed to update the DNS route of the link: {err or out}")
+        return self._exit_apply(protocol_type)
+
+    def exit_unlink(self, protocol_type):
+        """Tear the link down live and delete exit0.conf; the key pair stays
+        so a re-link reuses the public key already known to the exit."""
+        return self._exit_apply(protocol_type, teardown=True)
+
+    def exit_link_info(self, protocol_type):
+        """What the container believes it is linked to, or None. Reads only
+        the panel metadata, the address and the endpoint - never the key."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c 'test -f {EXIT_CONF} || exit 9; "
+            f"grep -E \"^# (ExitUid|ExitName|Obfuscation|DnsViaExit) =|^Address|^Endpoint\" {EXIT_CONF}'"
+        )
+        if code != 0:
+            return None
+        info = {}
+        for line in out.split('\n'):
+            stripped = line.strip().lstrip('#').strip()
+            if '=' not in stripped:
+                continue
+            key, _, value = stripped.partition('=')
+            info[key.strip()] = value.strip()
+        return {
+            'exit_uid': info.get('ExitUid', ''),
+            'exit_name': info.get('ExitName', ''),
+            'obfuscation': info.get('Obfuscation') == 'on',
+            'dns_via_exit': info.get('DnsViaExit') == 'on',
+            'address': info.get('Address', ''),
+            'endpoint': info.get('Endpoint', ''),
+        }
+
+    @staticmethod
+    def _parse_wg_peer_lists(text):
+        """Parse `wg show <if> latest-handshakes; ---; transfer; ---; endpoints`
+        (tab-separated, one peer per line) into per-peer dicts. `dump` is
+        avoided on purpose: its first line carries the interface private key."""
+        sections = [s.strip() for s in text.split('---')]
+        sections += [''] * (3 - len(sections))
+        peers = {}
+
+        def rows(section):
+            for line in section.split('\n'):
+                parts = line.strip().split('\t')
+                if len(parts) >= 2 and parts[0]:
+                    yield parts
+
+        for parts in rows(sections[0]):
+            try:
+                peers.setdefault(parts[0], {})['latest_handshake'] = int(parts[1])
+            except ValueError:
+                peers.setdefault(parts[0], {})['latest_handshake'] = 0
+        for parts in rows(sections[1]):
+            peer = peers.setdefault(parts[0], {})
+            try:
+                peer['rx_bytes'] = int(parts[1])
+                peer['tx_bytes'] = int(parts[2]) if len(parts) > 2 else 0
+            except ValueError:
+                peer['rx_bytes'], peer['tx_bytes'] = 0, 0
+        for parts in rows(sections[2]):
+            peers.setdefault(parts[0], {})['endpoint'] = '' if parts[1] == '(none)' else parts[1]
+        return peers
+
+    def exit_link_status(self, protocol_type, now=None):
+        """Live state of the link: None when the container has no link file,
+        otherwise up/handshake age/transfer/endpoint of the exit peer."""
+        container_name = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c 'test -f {EXIT_CONF} || exit 9; "
+            f"{wg_bin} show {EXIT_IFACE} latest-handshakes; echo ---; "
+            f"{wg_bin} show {EXIT_IFACE} transfer; echo ---; {wg_bin} show {EXIT_IFACE} endpoints'"
+        )
+        if code == 9:
+            return None
+        if code != 0:
+            return {'up': False, 'handshake_age': None, 'rx_bytes': 0, 'tx_bytes': 0,
+                    'endpoint': '', 'error': (err or out).strip()}
+        peers = self._parse_wg_peer_lists(out)
+        peer = next(iter(peers.values()), {})
+        handshake = peer.get('latest_handshake', 0)
+        age = int((now or time.time()) - handshake) if handshake else None
+        return {
+            'up': age is not None and 0 <= age < EXIT_HANDSHAKE_UP_SECONDS,
+            'handshake_age': age,
+            'rx_bytes': peer.get('rx_bytes', 0),
+            'tx_bytes': peer.get('tx_bytes', 0),
+            'endpoint': peer.get('endpoint', ''),
+        }
+
+    @staticmethod
+    def _egress_probe_script(subnet_ip):
+        """POSIX sh (single-quoted into `docker exec sh -c`, so no quotes of
+        its own) printing the client-path egress IP, `---`, and the container's
+        own egress IP."""
+        urls = ' '.join(EGRESS_CHECK_URLS)
+        probe = (
+            'x_ip() { for u in %s; do '
+            'r=$(curl -fsS -4 --max-time %d "$@" "$u" 2>/dev/null | tr -d "[:space:]"); '
+            'case "$r" in ""|*[!0-9.]*) ;; *) echo "$r"; return 0;; esac; '
+            'done; echo ""; }' % (urls, EGRESS_CHECK_TIMEOUT)
+        )
+        return f'{probe}; x_ip --interface {subnet_ip}; echo ---; x_ip'
+
+    @staticmethod
+    def _first_ipv4(text):
+        """First line of `text` that is a bare IPv4 address, or ''."""
+        for line in (text or '').split('\n'):
+            line = line.strip()
+            if IPV4_RE.match(line):
+                return line
+        return ''
+
+    def exit_check_egress(self, protocol_type):
+        """Which public IP the clients of this instance leave from, and which
+        one this node leaves from. The client probe is bound to the tunnel
+        gateway address, so it takes the client path (ip rule -> table 200 ->
+        exit0) instead of the container's default route; when no link is up it
+        simply reports the node's own address twice."""
+        container_name = self._container_name(protocol_type)
+        script = self._egress_probe_script(self._get_subnet_ip(protocol_type))
+        # both probes may fall through every URL before giving up
+        timeout = EGRESS_CHECK_TIMEOUT * len(EGRESS_CHECK_URLS) * 2 + 20
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} sh -c '{script}'", timeout=timeout)
+        if code != 0:
+            raise RuntimeError(f"Egress check failed: {(err or out).strip()}")
+        via, _, direct = out.partition('---')
+        return {'via_exit': self._first_ipv4(via), 'direct': self._first_ipv4(direct)}
 
     def remove_container(self, protocol_type):
         """Remove AWG container (mirrors remove_container.sh)."""
@@ -756,280 +1852,6 @@ tail -f /dev/null
         self.ssh.run_sudo_command(f"docker rmi {container_name}")
         return True
 
-    # ===================== PORT MANAGEMENT =====================
-
-    def _volume_name(self, protocol_type):
-        """Named volume that persists /opt/amnezia across container recreates."""
-        return f"{self._container_name(protocol_type)}-data"
-
-    def _build_run_cmd(self, protocol_type, published_ports, use_volume=True):
-        """Build the ``docker run`` command (image == locally-built tag).
-
-        ``published_ports`` is the set of UDP host ports to publish; mounting the
-        persistent data volume lets the container be recreated to change the
-        published-port set without losing keys.
-        """
-        container = self._container_name(protocol_type)
-        ports = " ".join(
-            f"-p {int(p)}:{int(p)}/udp"
-            for p in sorted({int(x) for x in published_ports})
-        )
-        vol = f"-v {self._volume_name(protocol_type)}:/opt/amnezia " if use_volume else ""
-        return (
-            f"docker run -d --restart always --privileged "
-            f"--cap-add=NET_ADMIN --cap-add=SYS_MODULE "
-            f"{ports} "
-            f"-v /lib/modules:/lib/modules "
-            f"{vol}"
-            f'--sysctl="net.ipv4.conf.all.src_valid_mark=1" '
-            f"--name {container} {container}"
-        )
-
-    def _current_listen_port(self, protocol_type):
-        """Real wg ListenPort from the server config (fallback: default)."""
-        try:
-            params = self._get_awg_params_from_config(protocol_type)
-            if params.get('port'):
-                return int(params['port'])
-        except Exception:
-            pass
-        return int(AWG_DEFAULTS['port'])
-
-    def _current_published_ports(self, protocol_type):
-        """Set of UDP host ports the container currently publishes."""
-        container = self._container_name(protocol_type)
-        out, _, code = self.ssh.run_sudo_command(f"docker port {container} 2>/dev/null")
-        ports = set()
-        if code == 0:
-            for line in out.splitlines():
-                m = re.match(r'\s*(\d+)/udp', line)
-                if m:
-                    ports.add(int(m.group(1)))
-        return ports
-
-    def _backup_data_dir(self, protocol_type):
-        """Copy /opt/amnezia out of the container to a host temp dir and verify
-        the critical key/config files are present. Runs BEFORE any destructive
-        step, fail-closed: raises (container untouched) if anything is missing,
-        so we never risk losing server keys."""
-        container = self._container_name(protocol_type)
-        host_backup = f"/tmp/amnz_backup_{container}"
-        self.ssh.run_sudo_command(f"rm -rf {host_backup} && mkdir -p {host_backup}")
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker cp {container}:/opt/amnezia/. {host_backup}/"
-        )
-        if code != 0:
-            raise RuntimeError(f"Failed to back up /opt/amnezia: {err or out}")
-
-        cfg = os.path.basename(self._config_path(protocol_type))
-        required = [
-            "awg/wireguard_server_private_key.key",
-            "awg/wireguard_server_public_key.key",
-            f"awg/{cfg}",
-        ]
-        for rel in required:
-            _, _, c = self.ssh.run_sudo_command(f"test -s {host_backup}/{rel}")
-            if c != 0:
-                raise RuntimeError(
-                    f"Backup incomplete (missing {rel}); aborting before any "
-                    f"destructive step — container left untouched."
-                )
-        return host_backup
-
-    def _recreate_container(self, protocol_type, published_ports, listen_port, host_backup):
-        """Recreate the container publishing ``published_ports`` (on the data
-        volume), restore the backed-up /opt/amnezia on top, write a start.sh
-        that redirects every non-listen port to ``listen_port``, and restart."""
-        container = self._container_name(protocol_type)
-
-        self.ssh.run_sudo_command(f"docker rm -f {container} 2>/dev/null")
-        run_cmd = self._build_run_cmd(protocol_type, published_ports, use_volume=True)
-        out, err, code = self.ssh.run_sudo_command(run_cmd)
-        if code != 0:
-            raise RuntimeError(f"docker run failed: {err or out}")
-        self._wait_container_running(container)
-
-        # Restore keys/config/clientsTable on top of the (image-seeded) volume.
-        self.ssh.run_sudo_command(f"docker cp {host_backup}/. {container}:/opt/amnezia/")
-
-        # start.sh: NAT for the (widened) subnet + redirects for alt ports.
-        network = self._get_subnet(protocol_type)
-        redirect_ports = [int(p) for p in published_ports if int(p) != int(listen_port)]
-        start_script = self._build_start_script(
-            protocol_type, network,
-            listen_port=int(listen_port), redirect_ports=redirect_ports,
-        )
-        self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
-        self.ssh.run_sudo_command(
-            f"docker cp /tmp/_amnz_start.sh {container}:/opt/amnezia/start.sh"
-        )
-        self.ssh.run_sudo_command(f"docker exec {container} chmod +x /opt/amnezia/start.sh")
-        self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
-
-        # Reconnect internal DNS network + restart so restored config & start.sh apply.
-        self.ssh.run_sudo_command(f"docker network connect amnezia-dns-net {container} 2>/dev/null")
-        self.ssh.run_sudo_command(f"docker restart {container}")
-        self._wait_container_running(container)
-
-    def reconfigure_ports(self, protocol_type, listen_port, published_ports):
-        """Change the set of UDP ports the server accepts, keeping wg on
-        ``listen_port`` and redirecting every other published port to it.
-
-        Keys/clients are backed up to the host first (fail-closed) and the data
-        dir is moved onto a persistent volume, so a recreate never loses keys.
-        On failure the previous port set is restored (best-effort rollback).
-        Returns the applied {listen_port, published_ports, redirected}.
-        """
-        if protocol_type not in (self.AWG, self.AWG2, self.AWG_LEGACY):
-            raise RuntimeError(f"Port reconfigure not supported for {protocol_type}")
-
-        listen_port = int(listen_port)
-        target = sorted({int(p) for p in published_ports} | {listen_port})
-        before = sorted(self._current_published_ports(protocol_type) or {listen_port})
-
-        # 1) Back up + verify keys BEFORE touching anything.
-        host_backup = self._backup_data_dir(protocol_type)
-        pubkey_before, _, _ = self.ssh.run_sudo_command(
-            f"cat {host_backup}/awg/wireguard_server_public_key.key"
-        )
-        pubkey_before = pubkey_before.strip()
-
-        # 2) Ensure the persistent data volume exists.
-        self.ssh.run_sudo_command(f"docker volume create {self._volume_name(protocol_type)}")
-
-        # 3) Recreate on the target ports; roll back to the previous set on error.
-        try:
-            self._recreate_container(protocol_type, target, listen_port, host_backup)
-        except Exception as e:
-            logger.exception("Port reconfigure failed, rolling back to %s", before)
-            try:
-                self._recreate_container(protocol_type, before, listen_port, host_backup)
-            except Exception:
-                logger.exception("Rollback ALSO failed; keys safe in %s", host_backup)
-                raise RuntimeError(
-                    f"Reconfigure and rollback both failed. Server keys are safe "
-                    f"in host backup {host_backup} (not deleted) — manual recovery needed."
-                ) from e
-            raise RuntimeError(
-                f"Port reconfigure failed ({e}); rolled back to previous ports {before}."
-            ) from e
-
-        # 4) Verify the server identity survived the recreate.
-        pubkey_after = self._get_server_public_key(protocol_type).strip()
-        if pubkey_after != pubkey_before:
-            raise RuntimeError(
-                f"Server public key changed after reconfigure! Backup kept at "
-                f"{host_backup} on host for recovery."
-            )
-
-        # Success — drop the host backup.
-        self.ssh.run_sudo_command(f"rm -rf {host_backup}")
-        return {
-            "listen_port": listen_port,
-            "published_ports": target,
-            "redirected": [p for p in target if p != listen_port],
-        }
-
-    # ===================== CONFIG SYNC / PEER HYGIENE =====================
-
-    def _allowed_ips_invalid(self, allowed):
-        """True if any address in an ``AllowedIPs`` value is not parseable
-        (e.g. 10.8.1.257/32 from the old allocator overflow bug)."""
-        for part in allowed.split(','):
-            ip = part.strip().split('/')[0].strip()
-            if not ip:
-                continue
-            try:
-                ipaddress.ip_address(ip)
-            except ValueError:
-                return True
-        return False
-
-    def _find_invalid_peers(self, config):
-        """List ``(public_key, allowed_ips)`` for peers with an invalid
-        AllowedIPs. A single such peer makes ``wg syncconf`` reject the WHOLE
-        config, so every peer added after it silently never loads into the live
-        interface (client is in the file but times out on connect)."""
-        invalid = []
-        for sec in config.split('['):
-            if not sec.lstrip().startswith('Peer]'):
-                continue
-            m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
-            if m and self._allowed_ips_invalid(m.group(1).strip()):
-                mp = re.search(r'PublicKey\s*=\s*([^\n]+)', sec)
-                invalid.append((mp.group(1).strip() if mp else '', m.group(1).strip()))
-        return invalid
-
-    def _purge_invalid_peers(self, protocol_type):
-        """Drop peers with invalid AllowedIPs from the server config file.
-        Returns the list of dropped ``(public_key, allowed_ips)`` (empty if the
-        config was already clean — then nothing is written)."""
-        config = self._get_server_config(protocol_type)
-        invalid = self._find_invalid_peers(config)
-        if not invalid:
-            return []
-
-        kept = []
-        for sec in config.split('['):
-            if sec.lstrip().startswith('Peer]'):
-                m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
-                if m and self._allowed_ips_invalid(m.group(1).strip()):
-                    continue  # drop this poisoned peer
-            kept.append(sec)
-        new_config = '['.join(kept)
-
-        container = self._container_name(protocol_type)
-        config_path = self._config_path(protocol_type)
-        self.ssh.upload_file(new_config, "/tmp/_amnz_purge.conf")
-        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_purge.conf {container}:{config_path}")
-        self.ssh.run_command("rm -f /tmp/_amnz_purge.conf")
-        logger.warning(
-            "Purged %d invalid AWG peer(s) from %s config: %s",
-            len(invalid), protocol_type, [a for _, a in invalid],
-        )
-        return invalid
-
-    def _sync_config(self, protocol_type):
-        """Sanitize then push the config into the kernel interface.
-
-        Sanitizing first means one leftover invalid peer can never again block
-        ``syncconf`` (and thus silently break every newly-added client)."""
-        dropped = self._purge_invalid_peers(protocol_type)
-        container = self._container_name(protocol_type)
-        wg_bin = self._wg_binary(protocol_type)
-        iface = self._interface_name(protocol_type)
-        config_path = self._config_path(protocol_type)
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
-        )
-        return dropped
-
-    def _live_peer_count(self, protocol_type):
-        """Number of peers currently loaded in the live wg interface."""
-        container = self._container_name(protocol_type)
-        wg_bin = self._wg_binary(protocol_type)
-        iface = self._interface_name(protocol_type)
-        out, _, _ = self.ssh.run_sudo_command(
-            f"docker exec -i {container} bash -c '{wg_bin} show {iface} peers | grep -c .'"
-        )
-        try:
-            return int(out.strip())
-        except (ValueError, AttributeError):
-            return -1
-
-    def cleanup_invalid_peers(self, protocol_type):
-        """Purge invalid-AllowedIPs peers and resync, reviving clients that were
-        stuck (present in the config file but absent from the live interface).
-        Returns a summary dict."""
-        before = self._live_peer_count(protocol_type)
-        dropped = self._sync_config(protocol_type)
-        after = self._live_peer_count(protocol_type)
-        return {
-            "dropped": [{"public_key": k, "allowed_ips": a} for k, a in dropped],
-            "peers_live_before": before,
-            "peers_live_after": after,
-        }
-
     # ===================== CLIENT MANAGEMENT =====================
 
     def _get_clients_table(self, protocol_type):
@@ -1038,10 +1860,12 @@ tail -f /dev/null
         clients_table_path = self._clients_table_path()
 
         out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} cat {clients_table_path} 2>/dev/null"
+            f"docker exec -i {container_name} sh -c 'if test -f {clients_table_path}; then cat {clients_table_path}; else exit 42; fi' "
         )
-        if code != 0 or not out.strip():
+        if code == 42:
             return []
+        if code != 0 or not out.strip():
+            raise RuntimeError(f"Cannot read clients table from {container_name}: {err or 'empty response'}")
 
         try:
             data = json.loads(out)
@@ -1053,13 +1877,12 @@ tail -f /dev/null
                 for client_id, info in data.items():
                     result.append({
                         'clientId': client_id,
-                        'userData': {
-                            'clientName': info.get('clientName', 'Unknown'),
-                        }
+                        'userData': dict(info),
                     })
                 return result
-        except json.JSONDecodeError:
-            return []
+        except json.JSONDecodeError as exc:
+            raise RuntimeError(f"Invalid clients table JSON in {container_name}") from exc
+        raise RuntimeError(f"Invalid clients table structure in {container_name}")
 
     def _save_clients_table(self, protocol_type, clients_table):
         """Save the clients table to the server."""
@@ -1069,13 +1892,124 @@ tail -f /dev/null
 
         # Write to /tmp via SFTP, then docker cp into container
         self.ssh.upload_file(content, "/tmp/_amnz_clients.json")
-        self.ssh.run_sudo_command(
+        _, err, code = self.ssh.run_sudo_command(
             f"docker cp /tmp/_amnz_clients.json {container_name}:{clients_table_path}"
         )
         self.ssh.run_command("rm -f /tmp/_amnz_clients.json")
+        if code != 0:
+            raise RuntimeError(f"Cannot save clients table in {container_name}: {err}")
+
+        # Preserve legacy containers: ordinary client operations must not
+        # install tc tooling or replace qdiscs unless limits were opted into.
+        try:
+            has_limits = any((c.get('userData') or {}).get('maxSpeed') for c in clients_table)
+            _, _, limits_exist = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} test -s {self._bwlimits_path()}"
+            )
+            if has_limits or limits_exist == 0:
+                self._apply_bw_limits(protocol_type, clients_table)
+        except Exception as err:
+            logger.warning(f"apply bw limits warning: {err}")
+
+    def _bwlimits_path(self):
+        """Flat file with per-peer speed limits, next to clientsTable."""
+        return '/opt/amnezia/awg/bwlimits'
+
+    @staticmethod
+    def _tc_apply_body(bw_path, config_path):
+        """Shell snippet applying per-peer limits from a flat file via tc.
+
+        File format (space separated): "<ipv4> <ipv6|-> <mbps>".
+        Rebuilds qdiscs from scratch; unclassified traffic is unlimited.
+        Limits both download (HTB class on egress) and upload (ingress policer).
+        """
+        return f"""
+BW={bw_path}
+IFACE=$(basename {config_path} .conf)
+[ -f "$BW" ] || exit 0
+command -v tc >/dev/null 2>&1 || exit 0
+ip link show dev $IFACE >/dev/null 2>&1 || exit 0
+tc qdisc del dev $IFACE root 2>/dev/null
+tc qdisc del dev $IFACE ingress 2>/dev/null
+tc qdisc add dev $IFACE root handle 1: htb default 0 2>/dev/null || exit 0
+tc qdisc add dev $IFACE handle ffff: ingress 2>/dev/null || true
+i=0
+while read -r ip4 ip6 mbps; do
+  [ -z "$ip4" ] && continue
+  [ -z "$mbps" ] && continue
+  kbit=$(echo "$mbps" | awk '{{printf "%d", $1*1000}}')
+  [ "$kbit" -gt 0 ] 2>/dev/null || continue
+  i=$((i+1))
+  cid=$((100+i))
+  tc class add dev $IFACE parent 1: classid 1:$cid htb rate ${{kbit}}kbit ceil ${{kbit}}kbit 2>/dev/null
+  tc filter add dev $IFACE parent 1: protocol ip u32 match ip dst $ip4/32 flowid 1:$cid 2>/dev/null
+  [ "$ip6" != "-" ] && [ -n "$ip6" ] && tc filter add dev $IFACE parent 1: protocol ipv6 u32 match ip6 dst $ip6/128 flowid 1:$cid 2>/dev/null
+  tc filter add dev $IFACE parent ffff: protocol ip u32 match ip src $ip4/32 police rate ${{kbit}}kbit burst 64k drop 2>/dev/null
+  [ "$ip6" != "-" ] && [ -n "$ip6" ] && tc filter add dev $IFACE parent ffff: protocol ipv6 u32 match ip6 src $ip6/128 police rate ${{kbit}}kbit burst 64k drop 2>/dev/null
+done < "$BW"
+"""
+
+    def _apply_bw_limits(self, protocol_type, clients_table):
+        """Write the flat bwlimits file into the container and apply via tc."""
+        container_name = self._container_name(protocol_type)
+        lines = []
+        for client in clients_table:
+            ud = client.get('userData', {}) or {}
+            try:
+                mbps = float(ud.get('maxSpeed') or 0)
+            except (TypeError, ValueError):
+                continue
+            if mbps <= 0:
+                continue
+            ip4 = ud.get('clientIp') or ''
+            ip6 = ud.get('clientIpv6') or '-'
+            if not ip4:
+                continue
+            lines.append(f"{ip4} {ip6} {mbps:g}")
+        content = "\n".join(lines) + ("\n" if lines else "")
+        self.ssh.upload_file(content, "/tmp/_amnz_bwlimits")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_bwlimits {container_name}:{self._bwlimits_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_bwlimits")
+        if self.check_container_running(protocol_type):
+            body = self._tc_apply_body(self._bwlimits_path(), self._resolve_config_path(protocol_type))
+            self.ssh.upload_file(body, "/tmp/_amnz_tc.sh")
+            self.ssh.run_sudo_command(
+                f"docker cp /tmp/_amnz_tc.sh {container_name}:/tmp/_amnz_tc.sh && "
+                f"docker exec {container_name} bash /tmp/_amnz_tc.sh",
+                timeout=60
+            )
+            self.ssh.run_command("rm -f /tmp/_amnz_tc.sh")
+
+    def set_speed_limit(self, protocol_type, client_id, max_speed):
+        """Set per-peer bandwidth limit in Mbit/s (0 = unlimited).
+
+        Enforced via tc inside the container (HTB on egress + ingress
+        policer), per peer IPv4/IPv6. Persisted in clientsTable
+        (userData.maxSpeed) and re-applied at container start from the
+        bwlimits flat file.
+        """
+        mbps = round(float(max_speed), 1)
+        if mbps < 0:
+            raise RuntimeError('max_speed must be >= 0')
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        ud = client.setdefault('userData', {})
+        if mbps == 0:
+            ud.pop('maxSpeed', None)
+        else:
+            ud['maxSpeed'] = mbps
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success', 'max_speed': mbps}
 
     def _get_server_config(self, protocol_type):
         """Get the server WireGuard config."""
+        cached = self._server_config_cache.get(protocol_type)
+        if cached and time.time() - cached[0] < self._CACHE_TTL:
+            return cached[1]
         container_name = self._container_name(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
 
@@ -1084,10 +2018,37 @@ tail -f /dev/null
         )
         if code != 0:
             raise RuntimeError(f"Failed to get server config: {err}")
+        self._server_config_cache[protocol_type] = (time.time(), out)
         return out
+
+    def _invalidate_config_cache(self, protocol_type):
+        """Forget the cached server config after the file in the container was
+        rewritten. Every writer must call this, otherwise a second read on the
+        same manager instance within _CACHE_TTL returns the pre-write content
+        (a peer removed and re-added in one go would be resurrected)."""
+        self._server_config_cache.pop(protocol_type, None)
+
+    @staticmethod
+    def _sanitize_server_config(config_content):
+        """awg-quick chokes on a bare `DNS =` key in the server config (it calls
+        resolvconf, which is missing in the container, and the interface goes
+        down). Convert active `DNS = ...` lines into `# DNS = ...` comments:
+        the panel still reads them via _get_dns(), but quick-tools ignore them."""
+        lines = []
+        for line in config_content.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('DNS') and '=' in stripped and not stripped.startswith('#'):
+                indent = line[:len(line) - len(line.lstrip())]
+                lines.append(f"{indent}# {stripped}")
+            else:
+                lines.append(line)
+        return '\n'.join(lines)
 
     def save_server_config(self, protocol_type, config_content):
         """Save the server WireGuard config and restart container."""
+        config_content = self._sanitize_server_config(config_content)
+        self._server_config_cache.pop(protocol_type, None)
+        self._config_path_cache.pop(protocol_type, None)
         container_name = self._container_name(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
 
@@ -1095,6 +2056,9 @@ tail -f /dev/null
         self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_edit_config.conf")
         self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_edit_config.conf {container_name}:{config_path}")
         self.ssh.run_command("rm -f /tmp/_amnz_edit_config.conf")
+
+        # Regenerate start script so iptables rules pick up the (possibly changed) subnet
+        self._write_start_script(protocol_type, config_path)
 
         # Restart container to apply all changes (including port and interface changes)
         self.ssh.run_sudo_command(f"docker restart {container_name}")
@@ -1144,6 +2108,7 @@ tail -f /dev/null
             'I5': 'i5',
             'CPS': 'cps',
         }
+        param_map.update({config_key: param_key for param_key, config_key in AWG3_PARAM_MAP})
 
         for line in config.split('\n'):
             line = line.strip()
@@ -1173,39 +2138,16 @@ tail -f /dev/null
                     ips.append(match.group(1))
         return ips
 
-    def _default_network(self):
-        return ipaddress.ip_network(
-            f"{AWG_DEFAULTS['subnet_address']}/{AWG_DEFAULTS['subnet_cidr']}",
-            strict=False,
-        )
-
-    def _get_subnet(self, protocol_type):
-        """Resolve the client-address pool for this server as an ip_network.
-
-        Anchored on the server's own ``Address`` IP, but widened to at least the
-        default pool prefix so existing /24 nodes can host more than 253 clients
-        *without manual reconfiguration*: allocation uses the wider /16 and
-        ``_ensure_subnet_nat`` extends the masquerade to match. We only ever
-        widen (smaller prefix), never narrow. Falls back to AWG defaults.
-        """
-        default_net = self._default_network()
-        try:
-            config = self._get_server_config(protocol_type)
-        except Exception:
-            config = ''
-        for line in config.split('\n'):
-            line = line.strip()
-            if line.startswith('Address'):
-                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', line)
-                if m:
-                    try:
-                        prefix = min(int(m.group(2)), default_net.prefixlen)
-                        return ipaddress.ip_network(
-                            f"{m.group(1)}/{prefix}", strict=False
-                        )
-                    except ValueError:
-                        break
-        return default_net
+    def _get_reserved_ips(self, protocol_type):
+        """Disabled clients retain their addresses until explicitly deleted."""
+        result = set()
+        for client in self._get_clients_table(protocol_type):
+            ud = client.get('userData') or {}
+            for value in (ud.get('clientIp'), ud.get('allowedIps')):
+                ip = self._extract_ipv4(value or '')
+                if ip:
+                    result.add(ip)
+        return result
 
     def _get_next_ip(self, protocol_type, extra_used=None):
         """Allocate the lowest free client IP inside the server's tunnel subnet.
@@ -1220,7 +2162,7 @@ tail -f /dev/null
         network = self._get_subnet(protocol_type)
 
         used = set()
-        for ip in self._get_used_ips(protocol_type):
+        for ip in set(self._get_used_ips(protocol_type)) | self._get_reserved_ips(protocol_type):
             try:
                 used.add(ipaddress.ip_address(ip))
             except ValueError:
@@ -1242,86 +2184,66 @@ tail -f /dev/null
             f"({len(used)} addresses in use) — widen subnet_cidr to allocate more."
         )
 
-    def _ip_in_subnet(self, ip_str, network):
-        """True if ``ip_str`` is a valid address that falls inside ``network``."""
-        try:
-            return ipaddress.ip_address(ip_str) in network
-        except ValueError:
-            return False
+    @staticmethod
+    def _peer_block_ip(block):
+        """Sort key for a [Peer] config block: its first AllowedIPs IPv4 address."""
+        match = re.search(r'AllowedIPs\s*=\s*(\d+)\.(\d+)\.(\d+)\.(\d+)', block)
+        if match:
+            return tuple(int(match.group(i)) for i in range(1, 5))
+        return (255, 255, 255, 255)
 
-    def _replace_server_peer(self, protocol_type, client_id, client_ip, psk):
-        """Drop any existing [Peer] for ``client_id`` and append a fresh one, then sync."""
+    def _insert_peer_sorted(self, protocol_type, peer_section):
+        """Insert a new [Peer] section into the server config keeping peers sorted by IP.
+
+        Creates a timestamped backup of the config inside the container before
+        overwriting it, then rewrites the file with all [Peer] sections ordered
+        by their AllowedIPs address.
+        """
         container_name = self._container_name(protocol_type)
-        config_path = self._config_path(protocol_type)
-        wg_bin = self._wg_binary(protocol_type)
-        iface = self._interface_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
 
         config = self._get_server_config(protocol_type)
-        new_sections = []
-        for section in config.split('['):
-            if not section.strip():
-                continue
-            if client_id in section:
-                continue
-            new_sections.append(section)
 
-        new_config = '[' + '['.join(new_sections)
-        new_config = new_config.rstrip() + f"""
-
-[Peer]
-PublicKey = {client_id}
-PresharedKey = {psk}
-AllowedIPs = {client_ip}/32
-"""
-        self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+        # Backup current config inside the container before modifying it
+        ts = __import__('datetime').datetime.now().strftime('%Y%m%d_%H%M%S')
         self.ssh.run_sudo_command(
-            f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
-        )
-        self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
-        self._sync_config(protocol_type)
-
-    def _repair_client_ip(self, protocol_type, client, clients_table, rewrite_peer=True):
-        """Ensure ``client`` holds a valid IP inside the current subnet.
-
-        Returns the (possibly newly assigned) client IP. If the stored IP is
-        malformed or outside the server subnet — e.g. legacy ``10.8.1.324`` rows
-        left by the old allocator — a fresh free IP is allocated and persisted
-        to the clients table. When ``rewrite_peer`` is true the server ``[Peer]``
-        AllowedIPs is also rewritten in place; callers that re-add the peer
-        themselves (e.g. enabling a client) pass ``False`` to avoid a duplicate.
-        This lets such clients be re-issued a working config without being
-        recreated (their keys are preserved).
-        """
-        ud = client.setdefault('userData', {})
-        current_ip = ud.get('clientIp', '')
-        network = self._get_subnet(protocol_type)
-        if self._ip_in_subnet(current_ip, network):
-            return current_ip
-
-        client_id = client.get('clientId', '')
-        # Avoid colliding with IPs held by other clients in the table.
-        extra_used = [
-            c.get('userData', {}).get('clientIp', '')
-            for c in clients_table
-            if c is not client and c.get('userData', {}).get('clientIp')
-        ]
-        new_ip = self._get_next_ip(protocol_type, extra_used=extra_used)
-        logger.warning(
-            "Repairing invalid AWG client IP %r -> %s for client %s",
-            current_ip, new_ip, client_id,
+            f"docker exec -i {container_name} cp {config_path} {config_path}.bak.{ts}"
         )
 
-        # The repaired address typically lands outside the legacy /24, so make
-        # sure the masquerade covers it before the peer goes live.
-        self._ensure_subnet_nat(protocol_type, network)
+        head, _, rest = config.partition('[Peer]')
+        blocks = []
+        if rest:
+            for chunk in rest.split('[Peer]'):
+                chunk = chunk.strip()
+                if chunk:
+                    blocks.append('[Peer]\n' + chunk)
 
-        if rewrite_peer:
-            psk = ud.get('psk', '') or self._get_server_psk(protocol_type)
-            self._replace_server_peer(protocol_type, client_id, new_ip, psk)
+        blocks.append(peer_section.strip())
+        blocks.sort(key=self._peer_block_ip)
 
-        ud['clientIp'] = new_ip
-        self._save_clients_table(protocol_type, clients_table)
-        return new_ip
+        new_config = head.rstrip('\n') + '\n\n' + '\n\n'.join(blocks) + '\n'
+
+        self.ssh.upload_file(new_config, "/tmp/_amnz_add_peer.conf")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_add_peer.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_add_peer.conf")
+        self._invalidate_config_cache(protocol_type)
+
+    def _extract_ipv4(self, value):
+        """Extract the first IPv4 address from AllowedIPs/clientIp-like values."""
+        if not value:
+            return ''
+        match = re.search(r'(\d+\.\d+\.\d+\.\d+)', str(value))
+        return match.group(1) if match else ''
+
+    def _client_ip_from_userdata(self, user_data):
+        """Return a valid client IP from stored userData, tolerating native Amnezia records."""
+        return (
+            self._extract_ipv4(user_data.get('clientIp'))
+            or self._extract_ipv4(user_data.get('allowedIps'))
+            or self._extract_ipv4(user_data.get('allowed_ip'))
+        )
 
     def _parse_peers_from_config(self, protocol_type):
         """Parse [Peer] sections from WireGuard server config and return dict of pubkey -> {allowedIps}."""
@@ -1403,6 +2325,31 @@ AllowedIPs = {client_ip}/32
         except Exception as e:
             logger.warning(f'get_clients: failed to parse conf peers: {e}')
 
+        # Connection flood monitoring: attach the latest snapshot written by
+        # the background collector (collect_conn_stats). Only if the snapshot
+        # does not exist yet (fresh install / right after upgrade) fall back
+        # to a one-off live count so the UI is not empty for the first minute.
+        try:
+            conn_counts = self._load_conn_counts(protocol_type)
+            if not conn_counts:
+                conn_counts = self._count_connections_by_ip(protocol_type)
+            conn_warnings = self._load_conn_warnings(protocol_type)
+            for client in clients_table:
+                user_data = client.get('userData', {})
+                ip = user_data.get('clientIp', '')
+                if not ip:
+                    m = re.search(r'(\d+\.\d+\.\d+\.\d+)', user_data.get('allowedIps', '') or '')
+                    ip = m.group(1) if m else ''
+                if not ip:
+                    continue
+                user_data['clientIp'] = ip
+                user_data['connCount'] = conn_counts.get(ip, 0)
+                if ip in conn_warnings:
+                    user_data['connWarnings'] = conn_warnings[ip]
+                client['userData'] = user_data
+        except Exception as e:
+            logger.warning(f'get_clients: conn monitoring failed: {e}')
+
         return clients_table
 
     def _parse_bytes(self, size_str):
@@ -1415,6 +2362,168 @@ AllowedIPs = {client_ip}/32
             return int(val * units.get(unit, 1))
         except Exception:
             return 0
+
+    # ---- Connection flood monitoring (P2P/torrent detection) ----
+
+    def _conn_warnings_path(self):
+        """Path inside container, next to clientsTable (persisted via volume)."""
+        return '/opt/amnezia/awg/conn_warnings.json'
+
+    def _count_connections_by_ip(self, protocol_type):
+        """Count conntrack entries per peer IP.
+
+        Aggregates /proc/net/nf_conntrack INSIDE the instance container
+        (NAT for the VPN subnet happens in the container's netns, so the
+        host table only shows the container's own IP) and transfers only
+        the compact "count ip" summary instead of the multi-megabyte raw
+        table.
+        Returns {ip: count}; empty dict if conntrack is unavailable.
+        """
+        try:
+            subnet_ip = self._get_subnet_ip(protocol_type)
+            cidr = int(self._get_subnet_cidr(protocol_type))
+            network = ipaddress.ip_network(f'{subnet_ip}/{cidr}', strict=False)
+        except Exception:
+            return {}
+
+        container = self._container_name(protocol_type)
+        # tr/grep/cut pipeline instead of awk: the command travels through a
+        # double remote shell (ssh + sh -c "..."), which mangles awk's $i
+        # fields no matter how they are escaped. Each conntrack line has two
+        # src= tokens (peer + external); the subnet filter below keeps only
+        # peer IPs, so counts match the awk version.
+        count_cmd = ("tr ' ' '\\n' < /proc/net/nf_conntrack 2>/dev/null "
+                     "| grep '^src=' | cut -d= -f2 | sort | uniq -c")
+        out, err, code = self.ssh.run_sudo_command(
+            f'docker exec -i {container} sh -c "{count_cmd}"'
+        )
+        if code != 0 or not out.strip():
+            return {}
+
+        counts = {}
+        for line in out.split('\n'):
+            parts = line.split()
+            if len(parts) != 2:
+                continue
+            cnt_s, ip = parts
+            try:
+                if ipaddress.ip_address(ip) in network:
+                    counts[ip] = int(cnt_s)
+            except ValueError:
+                continue
+        return counts
+
+    def _conn_counts_path(self):
+        """Path inside container with the latest per-IP connection counts."""
+        return '/opt/amnezia/awg/conn_counts.json'
+
+    def _load_conn_counts(self, protocol_type):
+        """Load latest {ip: count} snapshot written by the collector."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_counts_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return {k: int(v) for k, v in data.items()} if isinstance(data, dict) else {}
+        except (json.JSONDecodeError, ValueError, TypeError):
+            return {}
+
+    def _save_conn_counts(self, protocol_type, counts):
+        """Persist the {ip: count} snapshot into the container."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(counts), "/tmp/_amnz_conncount.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_conncount.json {container_name}:{self._conn_counts_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_conncount.json")
+
+    def collect_conn_stats(self, protocol_type):
+        """Background collector: one cheap SSH roundtrip per instance.
+
+        Counts conntrack entries per peer IP inside the container (compact
+        awk summary, no raw table transfer), saves the snapshot and records
+        flood warnings. Called by the panel's background monitor so that
+        detection runs 24/7 even when nobody has the UI open.
+        """
+        counts = self._count_connections_by_ip(protocol_type)
+        if not counts:
+            return False
+        try:
+            self._save_conn_counts(protocol_type, counts)
+        except Exception as e:
+            logger.warning(f'failed to save conn counts: {e}')
+        self._update_conn_warnings(protocol_type, counts)
+        return True
+
+    def _load_conn_warnings(self, protocol_type):
+        """Load recorded warnings {ip: [{ts, count}, ...]} from the container."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} cat {self._conn_warnings_path()} 2>/dev/null"
+        )
+        if code != 0 or not out.strip():
+            return {}
+        try:
+            data = json.loads(out)
+            return data if isinstance(data, dict) else {}
+        except json.JSONDecodeError:
+            return {}
+
+    def _save_conn_warnings(self, protocol_type, warnings):
+        """Persist warnings into the container (same pattern as clientsTable)."""
+        container_name = self._container_name(protocol_type)
+        self.ssh.upload_file(json.dumps(warnings), "/tmp/_amnz_connwarn.json")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_connwarn.json {container_name}:{self._conn_warnings_path()}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_connwarn.json")
+
+    def _update_conn_warnings(self, protocol_type, counts):
+        """Record a warning for every peer above CONN_WARN_THRESHOLD.
+
+        At most one warning per peer per CONN_WARN_COOLDOWN seconds; only the
+        last CONN_WARN_MAX_EVENTS are kept. Returns {ip: [{ts, count}, ...]}.
+        """
+        warnings = self._load_conn_warnings(protocol_type)
+        now = int(time.time())
+        changed = False
+        for ip, count in counts.items():
+            if count < CONN_WARN_THRESHOLD:
+                continue
+            events = warnings.get(ip, [])
+            if events and now - int(events[-1].get('ts', 0)) < CONN_WARN_COOLDOWN:
+                continue
+            events.append({'ts': now, 'count': count})
+            warnings[ip] = events[-CONN_WARN_MAX_EVENTS:]
+            changed = True
+        if changed:
+            try:
+                self._save_conn_warnings(protocol_type, warnings)
+            except Exception as e:
+                logger.warning(f'failed to save conn warnings: {e}')
+        return warnings
+
+    def clear_conn_warnings(self, protocol_type, client_id):
+        """Clear all recorded connection-flood warnings for one peer."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        ip = None
+        if client:
+            ud = client.get('userData', {}) or {}
+            ip = ud.get('clientIp')
+            if not ip:
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)', ud.get('allowedIps', '') or '')
+                ip = m.group(1) if m else None
+        if not ip:
+            raise RuntimeError('Client IP not found')
+        warnings = self._load_conn_warnings(protocol_type)
+        if ip in warnings:
+            warnings.pop(ip, None)
+            self._save_conn_warnings(protocol_type, warnings)
+        return {'status': 'success', 'cleared_ip': ip}
 
     def _wg_show(self, protocol_type):
         """Run 'wg show all' and parse output."""
@@ -1465,6 +2574,8 @@ AllowedIPs = {client_ip}/32
         config_path = self._resolve_config_path(protocol_type)
         iface = self._interface_name(protocol_type, config_path)
 
+        clients_table = self._get_clients_table(protocol_type)
+
         # Generate client keys
         client_priv_key, client_pub_key = generate_wg_keypair()
 
@@ -1474,10 +2585,10 @@ AllowedIPs = {client_ip}/32
 
         # Get next available IP
         client_ip = self._get_next_ip(protocol_type)
-
-        # Make sure NAT covers the (possibly widened) pool before handing out an
-        # address that may sit outside the legacy /24.
         self._ensure_subnet_nat(protocol_type, self._get_subnet(protocol_type))
+        # Dual-stack: derive the client's IPv6 when the tunnel has an IPv6 gateway
+        client_ipv6 = self._get_client_ipv6(protocol_type, client_ip)
+        allowed_ips = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
 
         # Get AWG params from server config
         awg_params = self._get_awg_params_from_config(protocol_type)
@@ -1487,20 +2598,16 @@ AllowedIPs = {client_ip}/32
 [Peer]
 PublicKey = {client_pub_key}
 PresharedKey = {psk}
-AllowedIPs = {client_ip}/32
+AllowedIPs = {allowed_ips}
 
 """
-        # Append peer to server config
-        escaped_peer = peer_section.replace("'", "'\\''")
-        self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
-        )
+        # Insert peer into server config, keeping peers sorted by IP (with backup)
+        self._insert_peer_sorted(protocol_type, peer_section)
 
         # Sync config without restart
         self._sync_config(protocol_type)
 
         # Update clients table — store keys for config reconstruction
-        clients_table = self._get_clients_table(protocol_type)
         new_client = {
             'clientId': client_pub_key,
             'userData': {
@@ -1512,29 +2619,26 @@ AllowedIPs = {client_ip}/32
                 'enabled': True,
             }
         }
+        if client_ipv6:
+            new_client['userData']['clientIpv6'] = client_ipv6
         clients_table.append(new_client)
         self._save_clients_table(protocol_type, clients_table)
 
         # Build client config
         awg_params = self._get_awg_params_from_config(protocol_type)
-        # NB: do NOT override `port` with the wg ListenPort here — the caller
-        # passes the *advertised* port (which may be an alternative published
-        # port that redirects to ListenPort). Endpoint must use what was passed.
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
-        mtu = AWG_DEFAULTS['mtu']
+        dns = self._get_dns(protocol_type)
+        mtu = self._get_mtu(protocol_type)
 
-        # Standard fields
+        # Standard fields (dual-stack when the client has an IPv6 address)
+        address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
+        dns6 = self._get_dns6(protocol_type) if client_ipv6 else ""
+        # Guard against duplicates: a manually saved client config may
+        # already carry the v6 resolver inside userData.dns.
+        dns_line = dns + (", " + dns6 if dns6 and dns6 not in dns else "")
         config_lines = [
-            f"Address = {client_ip}/32",
-            f"DNS = {dns1}, {dns2}",
+            f"Address = {address_line}",
+            f"DNS = {dns_line}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1558,22 +2662,27 @@ AllowedIPs = {client_ip}/32
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
+
+        # Route ::/0 only when the client actually holds an IPv6 address:
+        # claiming the IPv6 default route on an IPv4-only tunnel blackholes
+        # the client's own native IPv6.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
 
         client_config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
@@ -1598,39 +2707,39 @@ PersistentKeepalive = 25
             raise RuntimeError(f"Client {client_id} not found")
 
         ud = client.get('userData', {})
+        if ud.get('customConfig'):
+            return ud['customConfig']
         client_priv_key = ud.get('clientPrivateKey', '')
+        client_ip = self._client_ip_from_userdata(ud) or ''
         psk = ud.get('psk', '')
+        # Dual-stack: use the stored IPv6 or derive it from the IPv4 address
+        client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
 
         if not client_priv_key:
             raise RuntimeError("Client private key not stored. Config cannot be reconstructed.")
 
-        # Self-heal legacy invalid IPs (e.g. 10.8.1.324) so the config can be
-        # re-issued without recreating the client.
-        client_ip = self._repair_client_ip(protocol_type, client, clients_table)
+        if not self._ip_in_subnet(client_ip, self._get_subnet(protocol_type)):
+            client_ip = self._repair_client_ip(protocol_type, client, clients_table)
+            client_ipv6 = self._get_client_ipv6(protocol_type, client_ip)
 
         server_pub_key = self._get_server_public_key(protocol_type)
         if not psk:
             psk = self._get_server_psk(protocol_type)
 
         awg_params = self._get_awg_params_from_config(protocol_type)
-        # NB: do NOT override `port` with the wg ListenPort here — the caller
-        # passes the *advertised* port (which may be an alternative published
-        # port that redirects to ListenPort). Endpoint must use what was passed.
 
-        dns1 = AWG_DEFAULTS['dns1']
-        dns2 = AWG_DEFAULTS['dns2']
-        
-        # Check if AmneziaDNS is installed
-        out, _, _ = self.ssh.run_sudo_command("docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'")
-        if 'amnezia-dns' in out:
-            dns1 = '172.29.172.254'
-            
-        mtu = AWG_DEFAULTS['mtu']
+        dns = self._get_dns(protocol_type, ud)
+        mtu = self._get_mtu(protocol_type, ud)
 
-        # Standard fields
+        # Standard fields (dual-stack when the client has an IPv6 address)
+        address_line = f"{client_ip}/32" + (f", {client_ipv6}/128" if client_ipv6 else "")
+        dns6 = self._get_dns6(protocol_type, ud) if client_ipv6 else ""
+        # Guard against duplicates: a manually saved client config may
+        # already carry the v6 resolver inside userData.dns.
+        dns_line = dns + (", " + dns6 if dns6 and dns6 not in dns else "")
         config_lines = [
-            f"Address = {client_ip}/32",
-            f"DNS = {dns1}, {dns2}",
+            f"Address = {address_line}",
+            f"DNS = {dns_line}",
             f"PrivateKey = {client_priv_key}",
             f"MTU = {mtu}"
         ]
@@ -1654,22 +2763,25 @@ PersistentKeepalive = 25
             ('i4', 'I4'),
             ('i5', 'I5'),
             ('cps', 'CPS')
-        ]
+        ] + AWG3_PARAM_MAP
 
         for param_key, config_key in mapping:
             val = awg_params.get(param_key)
             if val:
                 # Basic compatibility filtering
-                if protocol_type == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS'):
+                if self._base_protocol(protocol_type) == self.AWG_LEGACY and config_key in ('S3', 'S4', 'I1', 'I2', 'I3', 'I4', 'I5', 'CPS') + AWG3_CONFIG_KEYS:
                     continue
                 config_lines.append(f"{config_key} = {val}")
+
+        # See the client-creation path: ::/0 only on dual-stack tunnels.
+        peer_allowed_ips = "0.0.0.0/0, ::/0" if client_ipv6 else "0.0.0.0/0"
 
         config = "[Interface]\n" + "\n".join(config_lines) + f"""
 
 [Peer]
 PublicKey = {server_pub_key}
 PresharedKey = {psk}
-AllowedIPs = 0.0.0.0/0, ::/0
+AllowedIPs = {peer_allowed_ips}
 Endpoint = {server_host}:{port}
 PersistentKeepalive = 25
 """
@@ -1681,10 +2793,13 @@ PersistentKeepalive = 25
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
         iface = self._interface_name(protocol_type, config_path)
+        clients_table = self._get_clients_table(protocol_type)
+        table_changed = False
 
         if enable:
-            # Re-add peer to server config
-            clients_table = self._get_clients_table(protocol_type)
+            # Re-add peer to server config. Native Amnezia clients may not have
+            # userData.clientIp in clientsTable, so recover it from allowedIps
+            # before falling back to a new free address.
             client = None
             for c in clients_table:
                 if c.get('clientId') == client_id:
@@ -1693,32 +2808,100 @@ PersistentKeepalive = 25
             if not client:
                 raise RuntimeError(f"Client {client_id} not found")
 
-            ud = client.get('userData', {})
+            ud = client.setdefault('userData', {})
             psk = ud.get('psk', '')
+            current_peer = self._parse_peers_from_config(protocol_type).get(client_id)
+            if current_peer:
+                ud['enabled'] = True
+                self._save_clients_table(protocol_type, clients_table)
+                return
+            client_ip = self._client_ip_from_userdata(ud)
+            if client_ip and not self._ip_in_subnet(client_ip, self._get_subnet(protocol_type)):
+                client_ip = None
+            if client_ip:
+                # A disabled client's address stays reserved in clientsTable.
+                # Refuse to re-enable when another client owns it now.
+                for other in clients_table:
+                    if other.get('clientId') == client_id:
+                        continue
+                    other_ip = self._extract_ipv4(
+                        (other.get('userData') or {}).get('allowedIps')
+                        or (other.get('userData') or {}).get('clientIp') or '')
+                    if other_ip == client_ip:
+                        raise RuntimeError(
+                            f"Cannot enable client: IP {client_ip} is already "
+                            f"reserved by another client. Resolve the conflict "
+                            f"(delete one of them) first.")
+                if client_ip in self._get_used_ips(protocol_type):
+                    raise RuntimeError(
+                        f"Cannot enable client: IP {client_ip} is already "
+                        f"present in the active server config")
+            if not client_ip:
+                client_ip = self._get_next_ip(protocol_type)
+                logger.warning(
+                    "Client %s had no saved AWG IP/AllowedIPs; assigning next free IP %s",
+                    client_id,
+                    client_ip,
+                )
+
+            self._ensure_subnet_nat(protocol_type, self._get_subnet(protocol_type))
+            ud['clientIp'] = client_ip
+            client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
+            allowed_ips = f'{client_ip}/32' + (f', {client_ipv6}/128' if client_ipv6 else '')
+            ud['allowedIps'] = allowed_ips
+            if client_ipv6:
+                ud['clientIpv6'] = client_ipv6
+            table_changed = True
 
             if not psk:
                 psk = self._get_server_psk(protocol_type)
-
-            # Heal legacy invalid IPs before re-adding the peer (this path
-            # appends the peer itself, so don't let repair rewrite it too).
-            client_ip = self._repair_client_ip(
-                protocol_type, client, clients_table, rewrite_peer=False
-            )
+                ud['psk'] = psk
+                table_changed = True
 
             peer_section = f"""
 [Peer]
 PublicKey = {client_id}
 PresharedKey = {psk}
-AllowedIPs = {client_ip}/32
+AllowedIPs = {allowed_ips}
 
 """
             escaped_peer = peer_section.replace("'", "'\\''")
             self.ssh.run_sudo_command(
                 f"docker exec -i {container_name} bash -c 'echo \"{escaped_peer}\" >> {config_path}'"
             )
+            self._invalidate_config_cache(protocol_type)
         else:
-            # Remove peer from server config
+            # Remove peer from server config, but first persist its current
+            # AllowedIPs so native/external clients can be enabled later.
             config = self._get_server_config(protocol_type)
+            conf_peers = self._parse_peers_from_config(protocol_type)
+            allowed_ips = conf_peers.get(client_id, {}).get('allowedIps', '')
+            client_ip = self._extract_ipv4(allowed_ips)
+            client = None
+            for c in clients_table:
+                if c.get('clientId') == client_id:
+                    client = c
+                    break
+            if client is None:
+                client = {
+                    'clientId': client_id,
+                    'userData': {
+                        'clientName': f'External ({client_ip})' if client_ip else 'External (native app)',
+                        'externalClient': True,
+                    }
+                }
+                clients_table.append(client)
+                table_changed = True
+
+            ud = client.setdefault('userData', {})
+            if client_ip:
+                ud['clientIp'] = client_ip
+                ud['allowedIps'] = allowed_ips or f'{client_ip}/32'
+                table_changed = True
+            if not ud.get('psk'):
+                ud['psk'] = self._get_server_psk(protocol_type)
+                table_changed = True
+
             sections = config.split('[')
             new_sections = []
             for section in sections:
@@ -1734,24 +2917,27 @@ AllowedIPs = {client_ip}/32
                 f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
             )
             self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
+            self._invalidate_config_cache(protocol_type)
 
         # Sync config
         self._sync_config(protocol_type)
 
         # Update enabled status in clients table
-        clients_table = self._get_clients_table(protocol_type)
         for c in clients_table:
             if c.get('clientId') == client_id:
                 c.setdefault('userData', {})['enabled'] = enable
+                table_changed = True
                 break
-        self._save_clients_table(protocol_type, clients_table)
-
+        if table_changed:
+            self._save_clients_table(protocol_type, clients_table)
     def remove_client(self, protocol_type, client_id):
         """Remove a client from AWG config (mirrors revokeWireGuard)."""
         container_name = self._container_name(protocol_type)
         wg_bin = self._wg_binary(protocol_type)
         config_path = self._resolve_config_path(protocol_type)
         iface = self._interface_name(protocol_type, config_path)
+
+        clients_table = self._get_clients_table(protocol_type)
 
         # Get current config
         config = self._get_server_config(protocol_type)
@@ -1774,16 +2960,265 @@ AllowedIPs = {client_ip}/32
             f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
         )
         self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
+        self._invalidate_config_cache(protocol_type)
 
         # Sync config
         self._sync_config(protocol_type)
 
         # Update clients table
-        clients_table = self._get_clients_table(protocol_type)
         clients_table = [c for c in clients_table if c.get('clientId') != client_id]
         self._save_clients_table(protocol_type, clients_table)
 
         return True
+    def _default_dns(self):
+        """Fallback DNS pair: the AmneziaDNS container when it is installed,
+        otherwise the built-in resolvers."""
+        dns1 = AWG_DEFAULTS['dns1']
+        dns2 = AWG_DEFAULTS['dns2']
+        try:
+            out, _, _ = self.ssh.run_sudo_command(
+                "docker ps -a --filter name=^amnezia-dns$ --format '{{.Names}}'"
+            )
+            if 'amnezia-dns' in out:
+                dns1 = '172.29.172.254'
+        except Exception:
+            pass
+        return f"{dns1}, {dns2}"
+
+    def _read_config_key(self, protocol_type, key):
+        """Read a key from the server config, comment or not.
+
+        MTU and DNS are stored commented out on purpose (see
+        _configure_container), so both forms have to be accepted.
+        """
+        try:
+            server_config = self._get_server_config(protocol_type)
+        except Exception:
+            return None
+        for line in server_config.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                stripped = stripped.lstrip('#').strip()
+            if '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            if name.strip() == key:
+                value = value.strip()
+                if value:
+                    return value
+        return None
+
+    def _get_dns(self, protocol_type, user_data=None):
+        """DNS servers for generated client configs.
+
+        Priority: per-client override (userData.dns, set by saving an edited
+        config) > `DNS = ...` line in the server config (wg-quick-style key,
+        stripped by awg-quick so it does not affect syncconf) > AmneziaDNS
+        container address > built-in defaults.
+        """
+        if user_data and user_data.get('dns'):
+            return user_data['dns']
+        return self._read_config_key(protocol_type, 'DNS') or self._default_dns()
+
+    def _get_dns6(self, protocol_type, user_data=None):
+        """IPv6 DNS appended to client configs on dual-stack tunnels.
+
+        Priority: per-client override (userData.dns6) > `# DNS6 = ...` line in
+        the server config (written at install when IPv6 is enabled) > built-in
+        default (Cloudflare v6)."""
+        if user_data and user_data.get('dns6'):
+            return user_data['dns6']
+        return self._read_config_key(protocol_type, 'DNS6') or AWG_DEFAULTS['dns6']
+
+    def get_awg_settings(self, protocol_type):
+        """Client-facing AWG settings currently stored in the server config."""
+        params = self._get_awg_params_from_config(protocol_type)
+        link_info = self.exit_link_info(protocol_type)
+        settings = {
+            'mtu': self._get_mtu(protocol_type),
+            'dns': self._get_dns(protocol_type),
+            'dns6': self._get_dns6(protocol_type),
+            'default_i1': AWG_DEFAULT_I1,
+            'supports_special_junk': self._base_protocol(protocol_type) != self.AWG_LEGACY,
+            # an instance behind an exit link cannot carry more than the link
+            'exit_linked': bool(link_info),
+            'exit_mtu': EXIT_MTU,
+        }
+        for key in SPECIAL_JUNK_KEYS:
+            settings[key] = params.get(key, '')
+        return settings
+
+    def update_awg_settings(self, protocol_type, mtu=None, dns=None, special_junk=None, dns6=None):
+        """Rewrite MTU/DNS/I1-I5 in the server config and apply them live.
+
+        I1-I5 go to the kernel through `awg syncconf`, so peers stay up; MTU
+        and DNS only matter when a client config is generated. Existing
+        clients pick the new values up on their next config export -- the
+        config they already imported keeps the old ones.
+        """
+        if self._base_protocol(protocol_type) == self.AWG_LEGACY:
+            special_junk = None
+        junk = normalize_special_junk(special_junk) if special_junk is not None else None
+
+        current_junk = self._get_awg_params_from_config(protocol_type)
+        config = self._get_server_config(protocol_type)
+        lines = config.split('\n')
+
+        def key_of(line):
+            stripped = line.strip()
+            if stripped.startswith('#'):
+                stripped = stripped.lstrip('#').strip()
+            if '=' not in stripped:
+                return None
+            return stripped.partition('=')[0].strip()
+
+        # A None means "leave this alone"; an empty string means "clear it",
+        # which drops the line so the built-in default applies again.
+        replaced = {}
+        if mtu is not None:
+            value = str(mtu).strip()
+            replaced['MTU'] = f"# MTU = {value}" if value else None
+        if dns is not None:
+            value = str(dns).strip()
+            replaced['DNS'] = f"# DNS = {value}" if value else None
+        if dns6 is not None:
+            value = str(dns6).strip()
+            replaced['DNS6'] = f"# DNS6 = {value}" if value else None
+        if junk is not None:
+            for key in SPECIAL_JUNK_KEYS:
+                value = junk.get(key)
+                replaced[key.upper()] = f"{key.upper()} = {value}" if value else None
+
+        # Everything lives in [Interface]; drop the old occurrences first so a
+        # cleared field really disappears instead of being shadowed.
+        interface_end = len(lines)
+        for idx, line in enumerate(lines):
+            if idx and line.strip().startswith('['):
+                interface_end = idx
+                break
+
+        head = [line for line in lines[:interface_end] if key_of(line) not in replaced]
+        while head and not head[-1].strip():
+            head.pop()
+        head.extend(value for value in replaced.values() if value)
+
+        tail = lines[interface_end:]
+        if tail:
+            head.append('')  # keep [Interface] and [Peer] visually apart
+        self._write_server_config(protocol_type, '\n'.join(head + tail))
+
+        if junk is not None:
+            # There is no way to spell an empty I1-I5 in a config file
+            # (get_value in amneziawg-tools rejects `I1 =`), so a dropped
+            # packet cannot be pushed through syncconf -- the kernel would
+            # keep sending the old one. Recreating the interface is the only
+            # way to make a removal take effect.
+            dropped = any(current_junk.get(key) and not junk.get(key)
+                          for key in SPECIAL_JUNK_KEYS)
+            if dropped:
+                self._restart_container(protocol_type)
+            else:
+                self._sync_server_config(protocol_type)
+        return self.get_awg_settings(protocol_type)
+
+    def _write_server_config(self, protocol_type, config_content):
+        """Upload the server config into the container without restarting it."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        self.ssh.upload_file(config_content.replace('\r\n', '\n'), "/tmp/_amnz_settings.conf")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_settings.conf {container_name}:{config_path}"
+        )
+        self.ssh.run_command("rm -f /tmp/_amnz_settings.conf")
+        self._invalidate_config_cache(protocol_type)
+        if code != 0:
+            raise RuntimeError(f"Failed to write server config: {err or out}")
+
+    def _restart_container(self, protocol_type):
+        """Restart the container so its start script recreates the interface."""
+        container_name = self._container_name(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(f"docker restart {container_name}")
+        if code != 0:
+            raise RuntimeError(f"Failed to restart {container_name}: {err or out}")
+
+    def _sync_server_config(self, protocol_type):
+        """Apply the on-disk server config to the running interface."""
+        container_name = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        quick_bin = self._quick_binary(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        iface = self._interface_name(protocol_type, config_path)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container_name} bash -c "
+            f"'{wg_bin} syncconf {iface} <({quick_bin} strip {config_path})'"
+        )
+        if code != 0:
+            raise RuntimeError(f"Failed to apply config: {err or out}")
+
+    def _get_mtu(self, protocol_type, user_data=None):
+        """MTU for generated client configs.
+
+        Priority: per-client override > `MTU = ...` line in the server config
+        > built-in default. Amnezia's own clients use 1376; the 1280 this
+        panel used to hardcode is itself a usable fingerprint.
+        """
+        if user_data and user_data.get('mtu'):
+            return str(user_data['mtu'])
+        return self._read_config_key(protocol_type, 'MTU') or AWG_DEFAULTS['mtu']
+
+    def save_client_config(self, protocol_type, client_id, config_text):
+        """Persist a manually edited client config. Stored verbatim in
+        clientsTable (userData.customConfig) and returned by get_client_config
+        from now on; the DNS and MTU lines are indexed into userData as the
+        per-client overrides _get_dns/_get_mtu read on future regenerations."""
+        config_text = (config_text or '').strip()
+        if not config_text:
+            raise RuntimeError('Config is empty')
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            raise RuntimeError('Client not found')
+        ud = client.setdefault('userData', {})
+        ud['customConfig'] = config_text
+        ud.pop('dns', None)
+        ud.pop('mtu', None)
+        indexed = {'DNS': 'dns', 'MTU': 'mtu'}
+        for line in config_text.split('\n'):
+            stripped = line.strip()
+            if stripped.startswith('#') or '=' not in stripped:
+                continue
+            name, _, value = stripped.partition('=')
+            field = indexed.get(name.strip())
+            if field and value.strip():
+                ud[field] = value.strip()
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success'}
+
+    def rename_client(self, protocol_type, client_id, new_name):
+        """Rename a client. The name lives only in the clientsTable
+        (userData.clientName); keys, IPs and the WireGuard config itself
+        are untouched, so existing configs keep working."""
+        clients_table = self._get_clients_table(protocol_type)
+        client = next((c for c in clients_table if c.get('clientId') == client_id), None)
+        if client is None:
+            # Peer added via the native Amnezia app is not in the table yet —
+            # persist a minimal entry so the chosen name sticks.
+            conf_peers = self._parse_peers_from_config(protocol_type)
+            if client_id not in conf_peers:
+                raise RuntimeError('Client not found')
+            client = {
+                'clientId': client_id,
+                'userData': {
+                    'clientName': new_name,
+                    'clientPrivateKey': '',
+                    'externalClient': True,
+                }
+            }
+            clients_table.append(client)
+        else:
+            client.setdefault('userData', {})['clientName'] = new_name
+        self._save_clients_table(protocol_type, clients_table)
+        return {'status': 'success', 'name': new_name}
 
     def get_server_status(self, protocol_type):
         """Get detailed status of the AWG server."""
@@ -1812,3 +3247,540 @@ AllowedIPs = {client_ip}/32
                     info['error'] = str(e)
 
         return info
+
+    def _default_network(self):
+        return ipaddress.ip_network(
+            f"{AWG_DEFAULTS['subnet_address']}/{AWG_DEFAULTS['subnet_cidr']}",
+            strict=False,
+        )
+
+
+    def _get_subnet(self, protocol_type):
+        """Resolve the client-address pool for this server as an ip_network.
+
+        Anchored on the server's own ``Address`` IP, but widened to at least the
+        default pool prefix so existing /24 nodes can host more than 253 clients
+        *without manual reconfiguration*: allocation uses the wider /16 and
+        ``_ensure_subnet_nat`` extends the masquerade to match. We only ever
+        widen (smaller prefix), never narrow. Falls back to AWG defaults.
+        """
+        default_net = self._default_network()
+        try:
+            config = self._get_server_config(protocol_type)
+        except Exception:
+            config = ''
+        for line in config.split('\n'):
+            line = line.strip()
+            if line.startswith('Address'):
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', line)
+                if m:
+                    try:
+                        prefix = min(int(m.group(2)), default_net.prefixlen)
+                        return ipaddress.ip_network(
+                            f"{m.group(1)}/{prefix}", strict=False
+                        )
+                    except ValueError:
+                        break
+        return default_net
+
+
+    def _ip_in_subnet(self, ip_str, network):
+        """True if ``ip_str`` is a valid address that falls inside ``network``."""
+        try:
+            return ipaddress.ip_address(ip_str) in network
+        except ValueError:
+            return False
+
+
+    def _server_address(self, protocol_type):
+        """Return ``(ip, prefixlen)`` of the server's [Interface] Address, or
+        ``(None, None)`` if it can't be read/parsed."""
+        try:
+            config = self._get_server_config(protocol_type)
+        except Exception:
+            return None, None
+        for line in config.split('\n'):
+            s = line.strip()
+            if s.startswith('Address'):
+                m = re.search(r'(\d+\.\d+\.\d+\.\d+)\s*/\s*(\d+)', s)
+                if m:
+                    return m.group(1), int(m.group(2))
+        return None, None
+
+
+    def _apply_onlink_widen(self, protocol_type, ip_self, cur_prefix, target_prefix, network):
+        """Widen the tunnel interface's on-link subnet from ``ip_self/cur_prefix``
+        to ``ip_self/target_prefix`` — persistently (rewrites the server config so
+        a container restart / ``awg-quick up`` keeps the wide subnet) and live
+        (no restart, no session drop)."""
+        container = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        iface = self._interface_name(protocol_type, config_path)
+        want = f"{ip_self}/{target_prefix}"
+
+        # (a) Persist into the server config. Without this the fix is lost on the
+        #     next restart (awg-quick re-reads the narrow Address), so the live
+        #     swap below would only ever be a temporary patch.
+        config = self._get_server_config(protocol_type)
+        new_config = re.sub(
+            rf"(?m)^([ \t]*Address[ \t]*=[ \t]*){re.escape(ip_self)}/{cur_prefix}\b",
+            rf"\g<1>{want}",
+            config,
+        )
+        if new_config != config:
+            self.ssh.upload_file(new_config, "/tmp/_amnz_onlink.conf")
+            self.ssh.run_sudo_command(
+                f"docker cp /tmp/_amnz_onlink.conf {container}:{config_path}"
+            )
+            self._invalidate_config_cache(protocol_type)
+            self.ssh.run_command("rm -f /tmp/_amnz_onlink.conf")
+
+        # (b) Apply live: add the wide address, CONFIRM it is on the interface,
+        #     only then drop the narrow one. Add-before-del leaves no window
+        #     without an address, and the guard means a failed add never strips
+        #     the only address off the live tunnel.
+        self.ssh.run_sudo_command(
+            f"docker exec -i {container} ip addr add {want} dev {iface}"
+        )
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec -i {container} ip -o -4 addr show dev {iface}"
+        )
+        if want in out:
+            self.ssh.run_sudo_command(
+                f"docker exec -i {container} ip addr del {ip_self}/{cur_prefix} dev {iface}"
+            )
+        logger.warning(
+            "Widened AWG tunnel on-link %s/%s -> %s on %s (%s)",
+            ip_self, cur_prefix, want, container, protocol_type,
+        )
+
+
+    def _ensure_tunnel_onlink(self, protocol_type, network):
+        """Best-effort per-client auto-heal: widen the tunnel on-link subnet to
+        ``network`` if the interface is still on a narrower prefix. Idempotent;
+        only ever widens (smaller prefix), never narrows."""
+        try:
+            ip_self, cur = self._server_address(protocol_type)
+            if ip_self and cur is not None and cur > network.prefixlen:
+                self._apply_onlink_widen(
+                    protocol_type, ip_self, cur, network.prefixlen, network
+                )
+        except Exception:
+            container = self._container_name(protocol_type)
+            logger.exception(
+                "Failed to widen tunnel on-link on %s (%s)", container, protocol_type
+            )
+
+
+    def heal_tunnel_onlink(self, protocol_type, apply=True):
+        """Detect (and optionally fix) a too-narrow on-link subnet on the tunnel
+        interface — the maintenance-script entrypoint (explicit reporting).
+
+        Returns a dict::
+
+            {'status': 'noop'|'widen'|'widened'|'unknown',
+             'ip': <server tunnel ip>, 'from': <cur prefix>, 'to': <target prefix>}
+
+        ``apply=False`` only reports (dry-run); ``apply=True`` widens in place."""
+        network = self._get_subnet(protocol_type)
+        ip_self, cur = self._server_address(protocol_type)
+        target = network.prefixlen
+        if not ip_self or cur is None:
+            return {'status': 'unknown'}
+        if cur <= target:
+            return {'status': 'noop', 'ip': ip_self, 'from': cur, 'to': cur}
+        result = {'status': 'widen', 'ip': ip_self, 'from': cur, 'to': target}
+        if apply:
+            self._apply_onlink_widen(protocol_type, ip_self, cur, target, network)
+            result['status'] = 'widened'
+        return result
+
+
+    def _volume_name(self, protocol_type):
+        """Named volume that persists /opt/amnezia across container recreates."""
+        return f"{self._container_name(protocol_type)}-data"
+
+
+    def _build_run_cmd(self, protocol_type, published_ports, use_volume=True):
+        container = self._container_name(protocol_type)
+        ports = sorted({int(p) for p in published_ports})
+        cmd = self._docker_run_cmd(container, container, ports[0], bool(self._get_subnet_ipv6_ip(protocol_type)))
+        cmd = cmd.replace(f"-p {ports[0]}:{ports[0]}/udp", ' '.join(f"-p {p}:{p}/udp" for p in ports))
+        if use_volume:
+            cmd = cmd.replace('--name ', f'-v {self._volume_name(protocol_type)}:/opt/amnezia --name ')
+        return cmd
+
+    def _current_listen_port(self, protocol_type):
+        """Real wg ListenPort from the server config (fallback: default)."""
+        try:
+            params = self._get_awg_params_from_config(protocol_type)
+            if params.get('port'):
+                return int(params['port'])
+        except Exception:
+            pass
+        return int(AWG_DEFAULTS['port'])
+
+
+    def _current_published_ports(self, protocol_type):
+        """Set of UDP host ports the container currently publishes."""
+        container = self._container_name(protocol_type)
+        out, _, code = self.ssh.run_sudo_command(f"docker port {container} 2>/dev/null")
+        ports = set()
+        if code == 0:
+            for line in out.splitlines():
+                m = re.match(r'\s*(\d+)/udp', line)
+                if m:
+                    ports.add(int(m.group(1)))
+        return ports
+
+
+    def _backup_data_dir(self, protocol_type):
+        """Copy /opt/amnezia out of the container to a host temp dir and verify
+        the critical key/config files are present. Runs BEFORE any destructive
+        step, fail-closed: raises (container untouched) if anything is missing,
+        so we never risk losing server keys."""
+        container = self._container_name(protocol_type)
+        host_backup = f"/tmp/amnz_backup_{container}"
+        self.ssh.run_sudo_command(f"rm -rf {host_backup} && mkdir -p {host_backup}")
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker cp {container}:/opt/amnezia/. {host_backup}/"
+        )
+        if code != 0:
+            raise RuntimeError(f"Failed to back up /opt/amnezia: {err or out}")
+
+        cfg = os.path.basename(self._config_path(protocol_type))
+        required = [
+            "awg/wireguard_server_private_key.key",
+            "awg/wireguard_server_public_key.key",
+            f"awg/{cfg}",
+        ]
+        for rel in required:
+            _, _, c = self.ssh.run_sudo_command(f"test -s {host_backup}/{rel}")
+            if c != 0:
+                raise RuntimeError(
+                    f"Backup incomplete (missing {rel}); aborting before any "
+                    f"destructive step — container left untouched."
+                )
+        return host_backup
+
+
+    def _recreate_container(self, protocol_type, published_ports, listen_port, host_backup):
+        """Recreate the container publishing ``published_ports`` (on the data
+        volume), restore the backed-up /opt/amnezia on top, write a start.sh
+        that redirects every non-listen port to ``listen_port``, and restart."""
+        container = self._container_name(protocol_type)
+
+        self.ssh.run_sudo_command(f"docker rm -f {container} 2>/dev/null")
+        run_cmd = self._build_run_cmd(protocol_type, published_ports, use_volume=True)
+        out, err, code = self.ssh.run_sudo_command(run_cmd)
+        if code != 0:
+            raise RuntimeError(f"docker run failed: {err or out}")
+        self._wait_container_running(container)
+
+        # Restore keys/config/clientsTable on top of the (image-seeded) volume.
+        self.ssh.run_sudo_command(f"docker cp {host_backup}/. {container}:/opt/amnezia/")
+
+        # start.sh: NAT for the (widened) subnet + redirects for alt ports.
+        network = self._get_subnet(protocol_type)
+        redirect_ports = [int(p) for p in published_ports if int(p) != int(listen_port)]
+        start_script = self._build_start_script(
+            protocol_type, network,
+            listen_port=int(listen_port), redirect_ports=redirect_ports,
+        )
+        self.ssh.upload_file(start_script, "/tmp/_amnz_start.sh")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_start.sh {container}:/opt/amnezia/start.sh"
+        )
+        self.ssh.run_sudo_command(f"docker exec {container} chmod +x /opt/amnezia/start.sh")
+        self.ssh.run_command("rm -f /tmp/_amnz_start.sh")
+
+        # Reconnect internal DNS network + restart so restored config & start.sh apply.
+        self.ssh.run_sudo_command(f"docker network connect amnezia-dns-net {container} 2>/dev/null")
+        self.ssh.run_sudo_command(f"docker restart {container}")
+        self._wait_container_running(container)
+
+
+    def reconfigure_ports(self, protocol_type, listen_port, published_ports):
+        """Change the set of UDP ports the server accepts, keeping wg on
+        ``listen_port`` and redirecting every other published port to it.
+
+        Keys/clients are backed up to the host first (fail-closed) and the data
+        dir is moved onto a persistent volume, so a recreate never loses keys.
+        On failure the previous port set is restored (best-effort rollback).
+        Returns the applied {listen_port, published_ports, redirected}.
+        """
+        if self._base_protocol(protocol_type) not in (self.AWG, self.AWG2, self.AWG_LEGACY):
+            raise RuntimeError(f"Port reconfigure not supported for {protocol_type}")
+
+        listen_port = int(listen_port)
+        target = sorted({int(p) for p in published_ports} | {listen_port})
+        before = sorted(self._current_published_ports(protocol_type) or {listen_port})
+
+        # 1) Back up + verify keys BEFORE touching anything.
+        host_backup = self._backup_data_dir(protocol_type)
+        pubkey_before, _, _ = self.ssh.run_sudo_command(
+            f"cat {host_backup}/awg/wireguard_server_public_key.key"
+        )
+        pubkey_before = pubkey_before.strip()
+
+        # 2) Ensure the persistent data volume exists.
+        self.ssh.run_sudo_command(f"docker volume create {self._volume_name(protocol_type)}")
+
+        # 3) Recreate on the target ports; roll back to the previous set on error.
+        try:
+            self._recreate_container(protocol_type, target, listen_port, host_backup)
+        except Exception as e:
+            logger.exception("Port reconfigure failed, rolling back to %s", before)
+            try:
+                self._recreate_container(protocol_type, before, listen_port, host_backup)
+            except Exception:
+                logger.exception("Rollback ALSO failed; keys safe in %s", host_backup)
+                raise RuntimeError(
+                    f"Reconfigure and rollback both failed. Server keys are safe "
+                    f"in host backup {host_backup} (not deleted) — manual recovery needed."
+                ) from e
+            raise RuntimeError(
+                f"Port reconfigure failed ({e}); rolled back to previous ports {before}."
+            ) from e
+
+        # 4) Verify the server identity survived the recreate.
+        pubkey_after = self._get_server_public_key(protocol_type).strip()
+        if pubkey_after != pubkey_before:
+            raise RuntimeError(
+                f"Server public key changed after reconfigure! Backup kept at "
+                f"{host_backup} on host for recovery."
+            )
+
+        # Success — drop the host backup.
+        self.ssh.run_sudo_command(f"rm -rf {host_backup}")
+        return {
+            "listen_port": listen_port,
+            "published_ports": target,
+            "redirected": [p for p in target if p != listen_port],
+        }
+
+
+    def _allowed_ips_invalid(self, allowed):
+        """True if any address in an ``AllowedIPs`` value is not parseable
+        (e.g. 10.8.1.257/32 from the old allocator overflow bug)."""
+        for part in allowed.split(','):
+            ip = part.strip().split('/')[0].strip()
+            if not ip:
+                continue
+            try:
+                ipaddress.ip_address(ip)
+            except ValueError:
+                return True
+        return False
+
+
+    def _find_invalid_peers(self, config):
+        """List ``(public_key, allowed_ips)`` for peers with an invalid
+        AllowedIPs. A single such peer makes ``wg syncconf`` reject the WHOLE
+        config, so every peer added after it silently never loads into the live
+        interface (client is in the file but times out on connect)."""
+        invalid = []
+        for sec in config.split('['):
+            if not sec.lstrip().startswith('Peer]'):
+                continue
+            m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
+            if m and self._allowed_ips_invalid(m.group(1).strip()):
+                mp = re.search(r'PublicKey\s*=\s*([^\n]+)', sec)
+                invalid.append((mp.group(1).strip() if mp else '', m.group(1).strip()))
+        return invalid
+
+
+    def _purge_invalid_peers(self, protocol_type):
+        """Drop peers with invalid AllowedIPs from the server config file.
+        Returns the list of dropped ``(public_key, allowed_ips)`` (empty if the
+        config was already clean — then nothing is written)."""
+        config = self._get_server_config(protocol_type)
+        invalid = self._find_invalid_peers(config)
+        if not invalid:
+            return []
+
+        kept = []
+        for sec in config.split('['):
+            if sec.lstrip().startswith('Peer]'):
+                m = re.search(r'AllowedIPs\s*=\s*([^\n]+)', sec)
+                if m and self._allowed_ips_invalid(m.group(1).strip()):
+                    continue  # drop this poisoned peer
+            kept.append(sec)
+        new_config = '['.join(kept)
+
+        container = self._container_name(protocol_type)
+        config_path = self._config_path(protocol_type)
+        self.ssh.upload_file(new_config, "/tmp/_amnz_purge.conf")
+        self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_purge.conf {container}:{config_path}")
+        self._invalidate_config_cache(protocol_type)
+        self.ssh.run_command("rm -f /tmp/_amnz_purge.conf")
+        logger.warning(
+            "Purged %d invalid AWG peer(s) from %s config: %s",
+            len(invalid), protocol_type, [a for _, a in invalid],
+        )
+        return invalid
+
+
+    def _sync_config(self, protocol_type):
+        """Sanitize then push the config into the kernel interface.
+
+        Sanitizing first means one leftover invalid peer can never again block
+        ``syncconf`` (and thus silently break every newly-added client)."""
+        dropped = self._purge_invalid_peers(protocol_type)
+        container = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        out, err, code = self.ssh.run_sudo_command(
+            f"docker exec -i {container} bash -c '{wg_bin} syncconf {iface} <({wg_bin}-quick strip {config_path})'"
+        )
+        if code != 0:
+            raise RuntimeError(f"Failed to sync AWG peers: {err or out}")
+        return dropped
+
+    def _live_peer_count(self, protocol_type):
+        """Number of peers currently loaded in the live wg interface."""
+        container = self._container_name(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+        out, _, _ = self.ssh.run_sudo_command(
+            f"docker exec -i {container} bash -c '{wg_bin} show {iface} peers | grep -c .'"
+        )
+        try:
+            return int(out.strip())
+        except (ValueError, AttributeError):
+            return -1
+
+
+    def cleanup_invalid_peers(self, protocol_type):
+        """Purge invalid-AllowedIPs peers and resync, reviving clients that were
+        stuck (present in the config file but absent from the live interface).
+        Returns a summary dict."""
+        before = self._live_peer_count(protocol_type)
+        dropped = self._sync_config(protocol_type)
+        after = self._live_peer_count(protocol_type)
+        return {
+            "dropped": [{"public_key": k, "allowed_ips": a} for k, a in dropped],
+            "peers_live_before": before,
+            "peers_live_after": after,
+        }
+
+
+    def _replace_server_peer(self, protocol_type, client_id, client_ip, psk):
+        """Drop any existing [Peer] for ``client_id`` and append a fresh one, then sync."""
+        container_name = self._container_name(protocol_type)
+        config_path = self._config_path(protocol_type)
+        wg_bin = self._wg_binary(protocol_type)
+        iface = self._interface_name(protocol_type)
+
+        config = self._get_server_config(protocol_type)
+        new_sections = []
+        for section in config.split('['):
+            if not section.strip():
+                continue
+            if client_id in section:
+                continue
+            new_sections.append(section)
+
+        new_config = '[' + '['.join(new_sections)
+        new_config = new_config.rstrip() + f"""
+
+[Peer]
+PublicKey = {client_id}
+PresharedKey = {psk}
+AllowedIPs = {client_ip}/32
+"""
+        self.ssh.upload_file(new_config, "/tmp/_amnz_config.conf")
+        self.ssh.run_sudo_command(
+            f"docker cp /tmp/_amnz_config.conf {container_name}:{config_path}"
+        )
+        self._invalidate_config_cache(protocol_type)
+        self.ssh.run_command("rm -f /tmp/_amnz_config.conf")
+        self._sync_config(protocol_type)
+
+
+    def _repair_client_ip(self, protocol_type, client, clients_table, rewrite_peer=True):
+        """Ensure ``client`` holds a valid IP inside the current subnet.
+
+        Returns the (possibly newly assigned) client IP. If the stored IP is
+        malformed or outside the server subnet — e.g. legacy ``10.8.1.324`` rows
+        left by the old allocator — a fresh free IP is allocated and persisted
+        to the clients table. When ``rewrite_peer`` is true the server ``[Peer]``
+        AllowedIPs is also rewritten in place; callers that re-add the peer
+        themselves (e.g. enabling a client) pass ``False`` to avoid a duplicate.
+        This lets such clients be re-issued a working config without being
+        recreated (their keys are preserved).
+        """
+        ud = client.setdefault('userData', {})
+        current_ip = ud.get('clientIp', '')
+        network = self._get_subnet(protocol_type)
+        if self._ip_in_subnet(current_ip, network):
+            return current_ip
+
+        client_id = client.get('clientId', '')
+        # Avoid colliding with IPs held by other clients in the table.
+        extra_used = [
+            c.get('userData', {}).get('clientIp', '')
+            for c in clients_table
+            if c is not client and c.get('userData', {}).get('clientIp')
+        ]
+        new_ip = self._get_next_ip(protocol_type, extra_used=extra_used)
+        logger.warning(
+            "Repairing invalid AWG client IP %r -> %s for client %s",
+            current_ip, new_ip, client_id,
+        )
+
+        # The repaired address typically lands outside the legacy /24, so make
+        # sure the masquerade covers it before the peer goes live.
+        self._ensure_subnet_nat(protocol_type, network)
+
+        if rewrite_peer:
+            psk = ud.get('psk', '') or self._get_server_psk(protocol_type)
+            self._replace_server_peer(protocol_type, client_id, new_ip, psk)
+
+        ud['clientIp'] = new_ip
+        self._save_clients_table(protocol_type, clients_table)
+        return new_ip
+
+
+    def _with_port_redirects(self, script, protocol_type, listen_port=None, redirect_ports=None):
+        listen_port = listen_port or self._current_listen_port(protocol_type)
+        ports = self._current_published_ports(protocol_type) if redirect_ports is None else redirect_ports
+        rules = '\n'.join(
+            f"iptables -t nat -C PREROUTING -p udp --dport {int(p)} -j REDIRECT --to-ports {int(listen_port)} 2>/dev/null || "
+            f"iptables -t nat -A PREROUTING -p udp --dport {int(p)} -j REDIRECT --to-ports {int(listen_port)}"
+            for p in sorted(ports) if int(p) != int(listen_port))
+        return script.replace('tail -f /dev/null', rules + '\ntail -f /dev/null') if rules else script
+
+    def _build_start_script(self, protocol_type, network, listen_port=None, redirect_ports=None):
+        # Upstream reads the subnet from Address at container start. Keep its
+        # AWG3/userspace, IPv6 and exit-node handling when restoring port support.
+        return self._with_port_redirects(self._render_start_script(protocol_type),
+                                         protocol_type, listen_port, redirect_ports)
+
+    def _ensure_subnet_nat(self, protocol_type, network):
+        """Retain the fork's live /16 repair without restarting or replacing start.sh."""
+        container = self._container_name(protocol_type)
+        src = str(network)
+        live = '; '.join(
+            f"iptables -t nat -C POSTROUTING -s {src} -o {iface} -j MASQUERADE 2>/dev/null || "
+            f"iptables -t nat -A POSTROUTING -s {src} -o {iface} -j MASQUERADE"
+            for iface in ('eth0', 'eth1'))
+        _, err, code = self.ssh.run_sudo_command(f"docker exec -i {container} sh -c '{live}'")
+        if code != 0:
+            raise RuntimeError(f"Cannot ensure AWG subnet routing: {err}")
+        # Old fork scripts hardcode /16 or /24; upstream scripts read Address.
+        # Add only the missing NAT rules, keeping all existing hooks/redirects.
+        script, err, code = self.ssh.run_sudo_command(f"docker exec -i {container} cat /opt/amnezia/start.sh")
+        if code != 0 or not script.strip():
+            raise RuntimeError(f"Cannot read AWG start script: {err}")
+        if src not in script and 'SUBNET=$(grep' not in script:
+            if 'tail -f /dev/null' not in script:
+                raise RuntimeError('Unrecognised AWG start script; refusing to replace it')
+            script = script.replace('tail -f /dev/null', live + '\ntail -f /dev/null')
+            self.ssh.upload_file(script, '/tmp/_amnz_start.sh')
+            _, err, code = self.ssh.run_sudo_command(f"docker cp /tmp/_amnz_start.sh {container}:/opt/amnezia/start.sh")
+            self.ssh.run_command('rm -f /tmp/_amnz_start.sh')
+            if code != 0:
+                raise RuntimeError(f"Cannot persist AWG subnet routing: {err}")
+        self._ensure_tunnel_onlink(protocol_type, network)

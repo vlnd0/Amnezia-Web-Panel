@@ -1,0 +1,2 @@
+# Keep upstream vendored bundles byte-for-byte, including template whitespace.
+static/vendor/** -whitespace

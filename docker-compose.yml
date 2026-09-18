@@ -2,7 +2,8 @@ version: '3.8'
 
 services:
   amnezia_panel:
-    image: prvtpro/amnezia-panel:1.4.4
+    build: .
+    image: amnezia-panel:fork-local
     container_name: amnezia_panel
 
     ports:
@@ -11,6 +12,10 @@ services:
     volumes:
       - amnezia_data:/app/data
 
+    environment:
+      DATA_FILE: /app/data/data.json
+      AWG_CONN_MONITOR: "off"
+      PRESERVE_SERVER_IDS: "on"
     restart: unless-stopped
 
     healthcheck:

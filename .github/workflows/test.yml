@@ -1,0 +1,23 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build test image
+      run: docker build -f Dockerfile.test -t amnezia-panel-tests .
+
+    - name: Run offline regression tests and undefined-name checks
+      run: docker run --rm --network none amnezia-panel-tests

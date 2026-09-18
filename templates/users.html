@@ -1,32 +1,33 @@
 {% extends "base.html" %}
 
 {% block title_extra %} — {{ _('users_title') }}{% endblock %}
+{% block page_class %}page page--users{% endblock %}
 
 {% block content %}
 <section>
-    <div class="flex items-center justify-between"
-        style="margin-bottom: var(--space-lg); gap: var(--space-md); flex-wrap: wrap;">
-        <h1 class="section-title" style="margin-bottom:0; flex-shrink: 0;">
-            <span class="icon">👥</span>
+    <div class="page-header page-header--with-search">
+        <h1 class="section-title page-header__title">
+            <span class="icon"><svg width="22" height="22" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2"/><circle cx="10" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/></svg></span>
             {{ _('users_title') }}
         </h1>
 
-        <div style="flex: 1; min-width: 250px; max-width: 500px; position: relative;">
+        <div class="page-header__search search-field toolbar-search">
             <input type="text" class="form-input" id="userSearch" placeholder="{{ _('search_placeholder') }}"
-                oninput="handleSearch(this.value)" style="padding-left: 40px;">
-            <span style="position: absolute; left: 14px; top: 50%; transform: translateY(-50%); opacity: 0.5;">🔍</span>
+                oninput="handleSearch(this.value)">
+            <span class="search-field-icon">🔍</span>
         </div>
 
         {% if current_user.role == 'admin' %}
-        <button class="btn btn-primary" onclick="openModal('addUserModal')" style="flex-shrink: 0;">
-            <span>＋</span> {{ _('add_user') }}
-        </button>
+        <div class="page-header__actions">
+            <button class="btn btn-primary" onclick="openModal('addUserModal')">
+                <span>＋</span> {{ _('add_user') }}
+            </button>
+        </div>
         {% endif %}
     </div>
 
     <div id="usersContainer" class="hidden">
-        <div class="clients-list" id="usersGrid"
-            style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
+        <div class="clients-list cards-grid-2" id="usersGrid">
             <!-- Users will be loaded here via JS -->
         </div>
 
@@ -66,23 +67,25 @@
             </div>
 
             <div class="form-group">
-                <label class="form-label">{{ _('password_label') }}</label>
-                <input class="form-input" type="password" id="newPassword" placeholder="••••••••" required>
+                <label class="form-label" id="newPasswordLabel">{{ _('password_label') }}</label>
+                <input class="form-input" type="password" id="newPassword" placeholder="••••••••">
+                <div class="form-hint" id="newPasswordHint">{{ _('password_optional_no_role') }}</div>
             </div>
 
             <div class="form-group">
                 <label class="form-label">{{ _('role_label') }}</label>
-                <select class="form-select" id="newRole">
+                <select class="form-select" id="newRole" onchange="toggleNewUserPasswordReq()">
+                    <option value="none" selected>{{ _('role_none_desc') }}</option>
                     <option value="user">{{ _('role_user_desc') }}</option>
                     <option value="support">{{ _('role_support_desc') }}</option>
                     <option value="admin">{{ _('role_admin_desc') }}</option>
                 </select>
             </div>
 
-            <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
+            <div class="grid grid-2">
                 <div class="form-group">
                     <label class="form-label">{{ _('tg_id_label') }}</label>
-                    <input class="form-input" type="text" id="newTelegramId" placeholder="@username or ID">
+                    <input class="form-input" type="text" id="newTelegramId" placeholder="Numeric Telegram ID">
                 </div>
                 <div class="form-group">
                     <label class="form-label">{{ _('email_label') }}</label>
@@ -90,7 +93,7 @@
                 </div>
             </div>
 
-            <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
+            <div class="grid grid-2">
                 <div class="form-group">
                     <label class="form-label">{{ _('traffic_limit_label') }}</label>
                     <input class="form-input" type="number" step="0.01" min="0" id="newTrafficLimit" placeholder="0">
@@ -108,7 +111,11 @@
 
             <div class="form-group">
                 <label class="form-label">{{ _('expiration_date_label') }}</label>
-                <input class="form-input" type="datetime-local" id="newExpirationDate">
+                <div class="grid grid-expiry">
+                    <input class="form-input" type="date" id="newExpirationDate" aria-label="Expiration date">
+                    <select class="form-select" id="newExpirationTime" aria-label="Expiration time"></select>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="clearDateTimeFields('newExpirationDate', 'newExpirationTime')">{{ _('no_expiry') }}</button>
+                </div>
             </div>
 
             <div class="form-group">
@@ -147,28 +154,28 @@
 
             <div id="newUserTelemtOptions" style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
                 <div class="form-group">
-                    <label class="form-label">Secret (Hex 32 chars)</label>
-                    <input class="form-input" type="text" id="newUserTelemtSecret" placeholder="Optional">
+                    <label class="form-label">{{ _('telemt_secret_label') }}</label>
+                    <input class="form-input" type="text" id="newUserTelemtSecret" placeholder="{{ _('optional') }}">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">AD Tag (Hex 32 chars)</label>
-                    <input class="form-input" type="text" id="newUserTelemtAdTag" placeholder="Optional">
+                    <label class="form-label">{{ _('telemt_ad_tag_label') }}</label>
+                    <input class="form-input" type="text" id="newUserTelemtAdTag" placeholder="{{ _('optional') }}">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Max TCP Conns</label>
-                    <input class="form-input" type="number" id="newUserTelemtMaxConns" placeholder="Optional" min="0">
+                    <label class="form-label">{{ _('telemt_max_conns_label') }}</label>
+                    <input class="form-input" type="number" id="newUserTelemtMaxConns" placeholder="{{ _('optional') }}" min="0">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Quota (Bytes)</label>
-                    <input class="form-input" type="number" id="newUserTelemtQuota" placeholder="Optional" min="0">
+                    <label class="form-label">{{ _('telemt_quota_label') }}</label>
+                    <input class="form-input" type="number" id="newUserTelemtQuota" placeholder="{{ _('optional') }}" min="0">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Max Unique IPs</label>
-                    <input class="form-input" type="number" id="newUserTelemtMaxIps" placeholder="Optional" min="1">
+                    <label class="form-label">{{ _('telemt_max_ips_label') }}</label>
+                    <input class="form-input" type="number" id="newUserTelemtMaxIps" placeholder="{{ _('optional') }}" min="1">
                 </div>
                 <div class="form-group">
-                    <label class="form-label">Expiration Date (ISO 8601)</label>
-                    <input class="form-input" type="text" id="newUserTelemtExpiry" placeholder="e.g. 2026-12-31T23:59:59Z">
+                    <label class="form-label">{{ _('expiration_date_label') }}</label>
+                    <input class="form-input" type="datetime-local" id="newUserTelemtExpiry">
                 </div>
             </div>
 
@@ -195,31 +202,45 @@
         <form id="editUserForm" onsubmit="event.preventDefault(); saveEditUser();">
             <input type="hidden" id="editUserId">
             <div class="form-group">
+                <label class="form-label">{{ _('username_label') }}</label>
+                <input type="text" class="form-input" id="editUserName" placeholder="username" required>
+            </div>
+            <div class="form-group">
                 <label class="form-label">{{ _('edit_user_tg') }}</label>
-                <input type="text" class="form-input" id="editUserTG" placeholder="@username or ID">
+                <input type="text" class="form-input" id="editUserTG" placeholder="Numeric Telegram ID">
             </div>
             <div class="form-group">
                 <label class="form-label">{{ _('edit_user_email') }}</label>
                 <input type="email" class="form-input" id="editUserEmail" placeholder="user@example.com">
             </div>
-            <div class="grid" style="display: grid; grid-template-columns: 1fr 1fr; gap: var(--space-md);">
+            <div class="grid grid-2">
                 <div class="form-group">
                     <label class="form-label">{{ _('edit_user_limit') }}</label>
                     <input type="number" step="0.01" min="0" class="form-input" id="editUserLimit" placeholder="0">
                 </div>
                 <div class="form-group">
                     <label class="form-label">{{ _('traffic_reset_strategy_label') }}</label>
-                    <select class="form-select" id="editUserTrafficResetStrategy">
-                        <option value="never">{{ _('traffic_reset_never') }}</option>
-                        <option value="daily">{{ _('traffic_reset_daily') }}</option>
-                        <option value="weekly">{{ _('traffic_reset_weekly') }}</option>
-                        <option value="monthly">{{ _('traffic_reset_monthly') }}</option>
-                    </select>
+                    <div class="row-between" style="gap: var(--space-sm);">
+                        <select class="form-select" id="editUserTrafficResetStrategy" style="flex: 1; min-width: 0;">
+                            <option value="never">{{ _('traffic_reset_never') }}</option>
+                            <option value="daily">{{ _('traffic_reset_daily') }}</option>
+                            <option value="weekly">{{ _('traffic_reset_weekly') }}</option>
+                            <option value="monthly">{{ _('traffic_reset_monthly') }}</option>
+                        </select>
+                        <button type="button" class="btn btn-secondary btn-sm" id="resetTrafficBtn" onclick="resetUserTraffic()">
+                            <span id="resetTrafficBtnText">{{ _('reset_traffic') }}</span>
+                            <div class="spinner hidden" id="resetTrafficSpinner"></div>
+                        </button>
+                    </div>
                 </div>
             </div>
             <div class="form-group">
                 <label class="form-label">{{ _('expiration_date_label') }}</label>
-                <input class="form-input" type="datetime-local" id="editUserExpiration">
+                <div class="grid grid-expiry">
+                    <input class="form-input" type="date" id="editUserExpiration" aria-label="Expiration date">
+                    <select class="form-select" id="editUserExpirationTime" aria-label="Expiration time"></select>
+                    <button type="button" class="btn btn-secondary btn-sm" onclick="clearDateTimeFields('editUserExpiration', 'editUserExpirationTime')">{{ _('no_expiry') }}</button>
+                </div>
             </div>
             <div class="form-group">
                 <label class="form-label">{{ _('description_label') }}</label>
@@ -277,7 +298,7 @@
 
         <div class="form-group" id="ucExistingClientGroup" style="display:none;">
             <label class="form-label">{{ _('select_existing_conn') }}</label>
-            <select class="form-select" id="ucExistingClient">
+            <select class="form-select" id="ucExistingClient" multiple size="6">
                 <option value="">{{ _('loading') }}</option>
             </select>
             <div class="form-hint">{{ _('existing_conn_hint') }}</div>
@@ -290,27 +311,27 @@
 
         <div id="ucTelemtOptions" style="display:none; padding: var(--space-md); background: rgba(0,0,0,0.03); border-radius: var(--radius-md); margin-bottom: var(--space-md);">
             <div class="form-group">
-                <label class="form-label">Secret (Hex 32 chars)</label>
-                <input class="form-input" type="text" id="ucTelemtSecret" placeholder="Optional">
+                <label class="form-label">{{ _('telemt_secret_label') }}</label>
+                <input class="form-input" type="text" id="ucTelemtSecret" placeholder="{{ _('optional') }}">
             </div>
             <div class="form-group">
-                <label class="form-label">AD Tag (Hex 32 chars)</label>
-                <input class="form-input" type="text" id="ucTelemtAdTag" placeholder="Optional">
+                <label class="form-label">{{ _('telemt_ad_tag_label') }}</label>
+                <input class="form-input" type="text" id="ucTelemtAdTag" placeholder="{{ _('optional') }}">
             </div>
             <div class="form-group">
-                <label class="form-label">Max TCP Conns</label>
-                <input class="form-input" type="number" id="ucTelemtMaxConns" placeholder="Optional" min="0">
+                <label class="form-label">{{ _('telemt_max_conns_label') }}</label>
+                <input class="form-input" type="number" id="ucTelemtMaxConns" placeholder="{{ _('optional') }}" min="0">
             </div>
             <div class="form-group">
-                <label class="form-label">Quota (Bytes)</label>
-                <input class="form-input" type="number" id="ucTelemtQuota" placeholder="Optional" min="0">
+                <label class="form-label">{{ _('telemt_quota_label') }}</label>
+                <input class="form-input" type="number" id="ucTelemtQuota" placeholder="{{ _('optional') }}" min="0">
             </div>
             <div class="form-group">
-                <label class="form-label">Max Unique IPs</label>
-                <input class="form-input" type="number" id="ucTelemtMaxIps" placeholder="Optional" min="1">
+                <label class="form-label">{{ _('telemt_max_ips_label') }}</label>
+                <input class="form-input" type="number" id="ucTelemtMaxIps" placeholder="{{ _('optional') }}" min="1">
             </div>
             <div class="form-group">
-                <label class="form-label">Expiration Date (ISO 8601)</label>
+                <label class="form-label">{{ _('telemt_expiry_label') }}</label>
                 <input class="form-input" type="text" id="ucTelemtExpiry" placeholder="e.g. 2026-12-31T23:59:59Z">
             </div>
         </div>
@@ -327,7 +348,7 @@
 
 <!-- ===== User Connections Modal ===== -->
 <div class="modal-backdrop" id="userConnsModal">
-    <div class="modal" style="max-width:600px;">
+    <div class="modal">
         <div class="modal-header">
             <h2 class="modal-title" id="userConnsTitle">{{ _('user_conns_title') }}</h2>
             <button class="modal-close" onclick="closeModal('userConnsModal')">×</button>
@@ -369,7 +390,14 @@
         </div>
         <div class="config-panel" id="panel-qr">
             <div class="qr-container">
+                <div class="qr-format hidden" id="qrFormat">
+                    <button type="button" class="qr-format-btn active" data-fmt="amnezia"
+                        onclick="setQrFormat('amnezia')">{{ _('qr_format_amnezia') }}</button>
+                    <button type="button" class="qr-format-btn" data-fmt="wireguard"
+                        onclick="setQrFormat('wireguard')">{{ _('qr_format_wireguard') }}</button>
+                </div>
                 <div id="qrCode"></div>
+                <div class="qr-hint" id="qrFormatHint"></div>
             </div>
         </div>
     </div>
@@ -379,6 +407,10 @@
 {% block scripts %}
 <script>
     let currentUserId = '';
+    // var on purpose: #166 declares the same globals; var redeclaration is
+    // legal either merge order, a duplicate let would be a SyntaxError.
+    var currentConnsUserId = '';
+    var currentConnsUsername = '';
     let currentConfig = '';
     let currentVpnLink = '';
     let currentConfigName = 'connection';
@@ -389,6 +421,54 @@
     let searchTimeout = null;
 
     const serversData = {{ servers | tojson }};
+
+    function populateTimeSelect(selectId) {
+        const select = document.getElementById(selectId);
+        if (!select || select.options.length) return;
+        for (let hour = 0; hour < 24; hour++) {
+            for (const minute of [0, 15, 30, 45]) {
+                const value = `${String(hour).padStart(2, '0')}:${String(minute).padStart(2, '0')}`;
+                select.add(new Option(value, value));
+            }
+        }
+        select.add(new Option('23:59', '23:59'));
+        select.value = '23:59';
+    }
+
+    function setupDateTimeFields() {
+        populateTimeSelect('newExpirationTime');
+        populateTimeSelect('editUserExpirationTime');
+    }
+
+    function clearDateTimeFields(dateId, timeId) {
+        const dateEl = document.getElementById(dateId);
+        const timeEl = document.getElementById(timeId);
+        if (dateEl) dateEl.value = '';
+        if (timeEl) timeEl.value = '23:59';
+    }
+
+    function getDateTimeValue(dateId, timeId) {
+        const date = document.getElementById(dateId).value;
+        if (!date) return null;
+        const time = document.getElementById(timeId).value || '23:59';
+        return `${date}T${time}`;
+    }
+
+    function setDateTimeValue(dateId, timeId, value) {
+        const dateEl = document.getElementById(dateId);
+        const timeEl = document.getElementById(timeId);
+        const localValue = toDateTimeLocalValue(value);
+        if (!localValue) {
+            clearDateTimeFields(dateId, timeId);
+            return;
+        }
+        dateEl.value = localValue.slice(0, 10);
+        const timeValue = localValue.slice(11, 16);
+        if (![...timeEl.options].some(option => option.value === timeValue)) {
+            timeEl.add(new Option(timeValue, timeValue));
+        }
+        timeEl.value = timeValue;
+    }
 
     function handleSearch(val) {
         clearTimeout(searchTimeout);
@@ -402,6 +482,18 @@
     function changePage(delta) {
         currentPage += delta;
         refreshUsersList();
+    }
+
+    function escapeHtml(value) {
+        return String(value ?? '').replace(/[&<>"']/g, ch => ({
+            '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;'
+        }[ch]));
+    }
+
+    function escapeJs(value) {
+        return String(value ?? '').replace(/[\\'"\n\r<>]/g, ch => ({
+            '\\': '\\\\', "'": "\\'", '"': '\\"', '\n': '\\n', '\r': '\\r', '<': '\\x3c', '>': '\\x3e'
+        }[ch]));
     }
 
     async function refreshUsersList() {
@@ -424,15 +516,15 @@
             }
 
             grid.innerHTML = data.users.map(u => `
-                <div class="client-item" id="user-${u.id}" style="${u.enabled ? '' : 'opacity:0.5;'}">
+                <div class="client-item entity-card user-card" id="user-${u.id}" style="${u.enabled ? '' : 'opacity:0.5;'}">
                     <div class="client-info">
                         <div class="client-avatar">${u.username[0].toUpperCase()}</div>
-                        <div>
+                        <div class="entity-card-body user-card-body">
                             <div class="client-name">
                                 ${u.username}
-                                <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : 'warn')}" 
+                                <span class="badge badge-${u.role === 'admin' ? 'success' : (u.role === 'support' ? 'info' : (u.role === 'none' ? 'secondary' : 'warn'))}"
                                       style="font-size:0.65rem; margin-left: var(--space-xs);">
-                                    ${u.role.toUpperCase()}
+                                    ${u.role === 'none' ? _('role_none_badge') : u.role.toUpperCase()}
                                 </span>
                                 <span class="badge badge-secondary" style="font-size:0.65rem; opacity: 0.7;">
                                     ${u.source}
@@ -456,8 +548,8 @@
                         limitHtml = `
                                          <div style="margin-top: 8px; font-size: 0.75rem;">
                                             <div style="display:flex; justify-content:space-between; color:var(--text-muted); margin-bottom: 2px;">
-                                                <span>${_('traffic')}: ${(u.traffic_used / Math.pow(1024, 3)).toFixed(2)} ГБ</span>
-                                                <span>${_('out_of')} ${(u.traffic_limit / Math.pow(1024, 3)).toFixed(2)} ГБ</span>
+                                                <span>${_('traffic')}: ${(u.traffic_used / Math.pow(1024, 3)).toFixed(2)} ${_('gb')}</span>
+                                                <span>${_('out_of')} ${(u.traffic_limit / Math.pow(1024, 3)).toFixed(2)} ${_('gb')}</span>
                                             </div>
                                             <div style="width: 100%; height: 4px; background: var(--bg-tertiary); border-radius: 2px; overflow: hidden;">
                                                 <div style="background-color: ${colorClass}; height: 100%; width: ${pct}%; transition: width 0.3s ease;"></div>
@@ -467,7 +559,7 @@
                     } else if (u.traffic_used > 0) {
                         limitHtml = `
                                         <div style="margin-top: 8px; font-size: 0.75rem; color:var(--text-muted);">
-                                            <span>${_('traffic')}: ${(u.traffic_used / Math.pow(1024, 3)).toFixed(2)} ГБ</span>
+                                            <span>${_('traffic')}: ${(u.traffic_used / Math.pow(1024, 3)).toFixed(2)} ${_('gb')}</span>
                                         </div>
                                     `;
                     }
@@ -475,33 +567,33 @@
                 })()}
                             ${(() => {
                     if (u.traffic_total > 0) {
-                        return `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6; margin-top: 2px;">📈 ${_('traffic_used_total')}: ${(u.traffic_total / Math.pow(1024, 3)).toFixed(2)} ГБ</div>`;
+                        return `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6; margin-top: 2px;">📈 ${_('traffic_used_total')}: ${(u.traffic_total / Math.pow(1024, 3)).toFixed(2)} ${_('gb')}</div>`;
                     }
                     return '';
                 })()}
                              ${u.traffic_reset_strategy !== 'never' ? `<div class="client-meta" style="font-size: 0.7rem; opacity: 0.6;">🔄 ${_('traffic_reset_strategy_label')}: ${_('traffic_reset_' + u.traffic_reset_strategy)}</div>` : ''}
                         </div>
                     </div>
-                    <div class="client-actions" style="flex-wrap: wrap; justify-content: flex-end; max-width: 140px;">
+                    <div class="client-actions entity-card-actions">
                         {% if current_user.role == 'admin' %}
                         <button class="btn btn-secondary btn-sm btn-icon" 
                                 onclick="openAddConnectionForUser('${u.id}', '${u.username}')" 
                                 title="${_('add_connection')}">🔗</button>
                         <button class="btn btn-secondary btn-sm btn-icon" 
                                 onclick='openEditUser({"id": "${u.id}", "username": "${u.username}", "tg": "${u.telegramId || ""}", "email": "${u.email || ""}", "desc": "${u.description || ""}", "limit": "${u.traffic_limit ? (u.traffic_limit / Math.pow(1024, 3)).toFixed(2) : 0}", "strategy": "${u.traffic_reset_strategy || 'never'}", "expiration": "${u.expiration_date || ''}"})'
-                                title="${_('edit')}">✏️</button>
+                                title="${_('edit')}">${ICON_PENCIL}</button>
                         <button class="btn btn-secondary btn-sm btn-icon" onclick="openShareModal(this.dataset)"
                                 data-id="${u.id}" data-username="${u.username}" data-token="${u.share_token || ''}"
                                 data-enabled="${u.share_enabled ? 'true' : 'false'}"
                                 data-haspassword="${u.has_share_password ? 'true' : 'false'}"
                                 title="${_('share_access')}">📤</button>
                         ${u.id !== "{{ current_user.id }}" ? `
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="toggleUser(this.dataset)"
+                            <button class="btn btn-secondary btn-sm btn-icon peer-toggle${u.enabled ? '' : ' peer-toggle-off'}" onclick="toggleUser(this.dataset, this)"
                                     data-id="${u.id}" data-enable="${u.enabled ? 'false' : 'true'}"
                                     title="${u.enabled ? _('stop_btn') : _('start_btn')}">
-                                ${u.enabled ? '🔵' : '⚫'}
+                                💡
                             </button>
-                            <button class="btn btn-danger btn-sm btn-icon" onclick="deleteUser('${u.id}')" title="${_('delete')}">🗑</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="deleteUser('${u.id}')" title="${_('delete')}">${ICON_TRASH}</button>
                         ` : ''}
                         {% endif %}
                     </div>
@@ -521,7 +613,14 @@
     }
 
     // Call on load
-    document.addEventListener('DOMContentLoaded', refreshUsersList);
+    document.addEventListener('DOMContentLoaded', () => {
+        setupDateTimeFields();
+        refreshUsersList();
+        // The role select starts on "none", where the password is optional;
+        // without this the label claims it is required until the select fires
+        // a change event.
+        toggleNewUserPasswordReq();
+    });
 
     function updateProtocols(serverId, selectId, groupId = null) {
         const select = document.getElementById(selectId);
@@ -538,7 +637,7 @@
         let count = 0;
 
         for (const [key, info] of Object.entries(protocols)) {
-            if (info.installed) {
+            if (info.installed && key !== 'exit') {  // exit node has no client connections
                 const opt = document.createElement('option');
                 opt.value = key;
                 opt.textContent = key === 'awg' ? 'AmneziaWG' : (key === 'awg2' ? 'AmneziaWG 2.0' : (key === 'awg_legacy' ? 'AWG Legacy' : (key === 'xray' ? 'Xray' : key.toUpperCase())));
@@ -590,8 +689,25 @@
         updateTelemtOptions('ucProtocol', 'ucTelemtOptions');
     });
 
+    function toggleNewUserPasswordReq() {
+        const needsPass = document.getElementById('newRole').value !== 'none';
+        const input = document.getElementById('newPassword');
+        input.required = needsPass;
+        document.getElementById('newPasswordLabel').textContent =
+            needsPass ? _('password_label') : _('password_label') + ' (' + _('optional') + ')';
+        // The hint only holds for "none"; leaving it up next to a required
+        // field makes the form contradict itself.
+        document.getElementById('newPasswordHint').style.display = needsPass ? 'none' : '';
+    }
+
     async function addUser(e) {
         e.preventDefault();
+        const role = document.getElementById('newRole').value;
+        const password = document.getElementById('newPassword').value;
+        if (role !== 'none' && !password) {
+            showToast(_('password_required_for_role'), 'error');
+            return;
+        }
         const btn = document.getElementById('addUserBtn');
         const text = document.getElementById('addUserBtnText');
         const spinner = document.getElementById('addUserSpinner');
@@ -601,14 +717,14 @@
         try {
             const body = {
                 username: document.getElementById('newUsername').value,
-                password: document.getElementById('newPassword').value,
-                role: document.getElementById('newRole').value,
+                password: password || null,
+                role: role,
                 telegramId: document.getElementById('newTelegramId').value || null,
                 email: document.getElementById('newEmail').value || null,
                 description: document.getElementById('newDescription').value || null,
                 traffic_limit: parseFloat(document.getElementById('newTrafficLimit').value || '0'),
                 traffic_reset_strategy: document.getElementById('newTrafficResetStrategy').value,
-                expiration_date: document.getElementById('newExpirationDate').value || null,
+                expiration_date: getDateTimeValue('newExpirationDate', 'newExpirationTime'),
             };
             const serverId = document.getElementById('newUserServer').value;
             if (serverId !== '') {
@@ -637,7 +753,7 @@
                 switchConfigTab('conf');
                 closeModal('addUserModal');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             } else {
                 setTimeout(() => window.location.reload(), 500);
             }
@@ -661,16 +777,29 @@
         }
     }
 
-    async function toggleUser(dataset) {
+    async function toggleUser(dataset, btn) {
+        const userId = dataset.id;
+        const enable = dataset.enable === 'true';
+        const original = btn ? btn.innerHTML : null;
+        // Lock the whole user card and swap the bulb for a spinner
+        const row = btn ? btn.closest('.client-item') : null;
+        if (row) {
+            row.classList.add('client-toggling');
+            row.querySelectorAll('button').forEach(b => b.disabled = true);
+        }
+        if (btn) btn.innerHTML = '<span class="spinner"></span>';
         try {
-            const userId = dataset.id;
-            const enable = dataset.enable === 'true';
             const action = enable ? _('enabling') : _('disabling');
             showToast(`${action}...`, 'info');
             await apiCall(`/api/users/${userId}/toggle`, 'POST', { enabled: enable });
             showToast(enable ? _('user_enabled') : _('user_disabled'), 'success');
             setTimeout(() => window.location.reload(), 500);
         } catch (err) {
+            if (row) {
+                row.classList.remove('client-toggling');
+                row.querySelectorAll('button').forEach(b => b.disabled = false);
+            }
+            if (btn && original !== null) btn.innerHTML = original;
             showToast(`${_('error')}: ` + err.message, 'error');
         }
     }
@@ -679,9 +808,21 @@
         currentUserId = userId;
         document.getElementById('addUserConnTitle').textContent = `${_('add_connection')} — ${username}`;
         document.getElementById('ucName').value = `${username}_vpn`;
-        document.getElementById('ucMode').value = 'new';
+        // Restore the options used for the previous add (mode/server/protocol)
+        let prefs = null;
+        try { prefs = JSON.parse(localStorage.getItem('addUserConnPrefs') || 'null'); } catch (e) {}
+        const modeEl = document.getElementById('ucMode');
+        const serverEl = document.getElementById('ucServer');
+        if (prefs) {
+            if ([...modeEl.options].some(o => o.value === prefs.mode)) modeEl.value = prefs.mode;
+            if ([...serverEl.options].some(o => o.value === String(prefs.server))) serverEl.value = String(prefs.server);
+        } else {
+            modeEl.value = 'new';
+        }
+        updateProtocols(serverEl.value, 'ucProtocol');
+        const protoEl = document.getElementById('ucProtocol');
+        if (prefs && [...protoEl.options].some(o => o.value === prefs.protocol)) protoEl.value = prefs.protocol;
         toggleUCMode();
-        updateProtocols(document.getElementById('ucServer').value, 'ucProtocol');
         openModal('addUserConnModal');
     }
 
@@ -739,11 +880,41 @@
                 name: document.getElementById('ucName').value || 'VPN Connection',
             };
 
+            // Remember the options for the next add
+            try {
+                localStorage.setItem('addUserConnPrefs', JSON.stringify({
+                    mode, server: document.getElementById('ucServer').value, protocol: body.protocol
+                }));
+            } catch (e) {}
+
             if (mode === 'existing') {
-                const clientId = document.getElementById('ucExistingClient').value;
-                if (!clientId) throw new Error(_('select_connection'));
-                body.client_id = clientId;
-            } else if (body.protocol === 'telemt') {
+                const selected = [...document.getElementById('ucExistingClient').selectedOptions]
+                    .map(o => o.value).filter(Boolean);
+                if (!selected.length) throw new Error(_('select_connection'));
+                let ok = 0, failed = 0, lastErr = '';
+                for (const clientId of selected) {
+                    try {
+                        await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', { ...body, client_id: clientId });
+                        ok++;
+                    } catch (e) {
+                        failed++;
+                        lastErr = e.message;
+                    }
+                }
+                if (!ok) throw new Error(lastErr || _('error'));
+                showToast(failed
+                    ? `${_('conn_linked')}: ${ok}, ${_('error')}: ${failed} (${lastErr})`
+                    : _('conn_linked') + (ok > 1 ? ` (${ok})` : ''), failed ? 'error' : 'success');
+                closeModal('addUserConnModal');
+                refreshUsersList();
+                const connsModal = document.getElementById('userConnsModal');
+                if (connsModal.classList.contains('active') && currentConnsUserId === currentUserId) {
+                    viewUserConnections(currentConnsUserId, currentConnsUsername);
+                }
+                return;
+            }
+
+            if (body.protocol === 'telemt') {
                 body.telemt_quota = document.getElementById('ucTelemtQuota').value || null;
                 body.telemt_max_ips = parseInt(document.getElementById('ucTelemtMaxIps').value) || null;
                 body.telemt_expiry = document.getElementById('ucTelemtExpiry').value || null;
@@ -753,10 +924,12 @@
             }
 
             const result = await apiCall(`/api/users/${currentUserId}/connections/add`, 'POST', body);
-            showToast(mode === 'existing' ? _('conn_linked') : _('connection_created').replace('{}', body.name), 'success');
+            showToast(_('connection_created').replace('{}', body.name), 'success');
             closeModal('addUserConnModal');
 
-            if (result.config) {
+            // Linking an existing peer: no config popup — the admin already
+            // has that config; just refresh the list.
+            if (result.config && mode !== 'existing') {
                 currentConfig = result.config;
                 currentVpnLink = result.vpn_link || '';
                 currentConfigName = document.getElementById('ucName').value.replace(/\s+/g, '_');
@@ -765,9 +938,10 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
-            setTimeout(() => window.location.reload(), 1000);
+            // Refresh the grid via AJAX — no full page reload.
+            refreshUsersList();
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
         } finally {
@@ -777,7 +951,21 @@
         }
     }
 
+    // var on purpose: #167 declares the same globals; var redeclaration is
+    // legal either merge order, a duplicate let would be a SyntaxError.
+    var currentConnsUserId = null;
+    var currentConnsUsername = '';
+
+    function formatConnDate(iso) {
+        if (!iso) return '';
+        const d = new Date(iso);
+        if (isNaN(d)) return '';
+        return d.toLocaleDateString();
+    }
+
     async function viewUserConnections(userId, username) {
+        currentConnsUserId = userId;
+        currentConnsUsername = username;
         document.getElementById('userConnsTitle').textContent = `${_('connections')} — ${username}`;
         const listEl = document.getElementById('userConnsList');
         listEl.innerHTML = `<div style="text-align:center;padding:var(--space-lg);color:var(--text-muted);">${_('loading')}</div>`;
@@ -790,26 +978,115 @@
             }
             listEl.innerHTML = '';
             data.connections.forEach(c => {
+                const sid = Number(c.server_id) || 0;
+                const proto = c.protocol || 'awg';
+                // Show the live peer name from the instance (matched by client
+                // id / IP) — the panel-side record name is just a label.
+                const name = c.peer_name || c.name || 'Connection';
+                const enabled = c.enabled !== false;
+                const ip = (c.allowed_ips || '').split(',')[0].split('/')[0].trim();
+                const maxSpeed = parseFloat(c.max_speed || 0) || 0;
+                const dateStr = formatConnDate(c.created_at);
+                const toggleCls = enabled ? 'peer-toggle' : 'peer-toggle peer-toggle-off';
+                const toggleTitle = enabled ? _('stop_peer_title') : _('start_peer_title');
+                const disabledStyle = enabled ? '' : 'opacity:0.5;';
+                // Deep link: opens the server page on the right instance and
+                // frames this peer's card there.
+                const serverLink = `/server/${sid}?protocol=${encodeURIComponent(proto)}&highlight=${encodeURIComponent(c.client_id)}`;
                 listEl.innerHTML += `
-                    <div class="client-item">
-                        <div class="client-info">
-                            <div class="client-avatar">🔗</div>
+                    <div class="client-item" data-maxspeed="${maxSpeed}">
+                        <div class="client-info" style="${disabledStyle}">
+                            <div class="client-avatar">${escapeHtml((name[0] || '🔗').toUpperCase())}</div>
                             <div>
-                                <div class="client-name">${c.name || 'Connection'}</div>
+                                <div class="client-name">${escapeHtml(name)}${ip ? ` <span class="client-ip">${escapeHtml(ip)}</span>` : ''}</div>
                                 <div class="client-meta">
-                                    <span>🖥 ${c.server_name || ''}</span>
-                                    <span>${c.protocol === 'awg' ? 'AmneziaWG' : (c.protocol === 'awg2' ? 'AmneziaWG 2.0' : (c.protocol === 'awg_legacy' ? 'AWG Legacy' : (c.protocol === 'xray' ? 'Xray' : c.protocol.toUpperCase())))}</span>
+                                    <span>🖥 <a href="${serverLink}" target="_blank" rel="noopener" style="color:var(--primary); text-decoration:underline;">${escapeHtml(c.server_name || '')}</a></span>
+                                    <span>${escapeHtml(proto === 'awg' ? 'AmneziaWG' : (proto === 'awg2' ? 'AmneziaWG 2.0' : (proto === 'awg_legacy' ? 'AWG Legacy' : (proto === 'xray' ? 'Xray' : (proto === 'wireguard' ? 'WireGuard' : proto.toUpperCase())))))}</span>
+                                    ${dateStr ? `<span>📅 ${dateStr}</span>` : ''}
+                                    <span class="traffic-badge traffic-limit" title="${_('max_speed')}">${maxSpeed > 0 ? '🐢 ' + maxSpeed + ' Mbps' : '⚡<span style="font-size:1.25em; line-height:0;">∞</span>'}</span>
+                                    ${c.data_sent ? `<span class="traffic-badge traffic-down">↓ ${escapeHtml(c.data_sent)}</span>` : ''}
+                                    ${c.data_received ? `<span class="traffic-badge traffic-up">↑ ${escapeHtml(c.data_received)}</span>` : ''}
                                 </div>
                             </div>
                         </div>
                         <div class="client-actions">
-                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showUserConnectionConfig(${c.server_id}, '${c.client_id}', '${c.protocol}', '${(c.name || 'VPN').replace(/'/g, "\\'")}')" title="${_('config')}">📄</button>
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="renameUserConnection(${sid}, '${escapeJs(c.client_id)}', '${escapeJs(proto)}', '${escapeJs(name)}')" title="${_('rename')}">${ICON_PENCIL}</button>
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="showUserConnectionConfig(${sid}, '${escapeJs(c.client_id)}', '${escapeJs(proto)}', '${escapeJs(name)}')" title="${_('config')}">📄</button>
+                            <button class="btn btn-secondary btn-sm btn-icon ${toggleCls}" onclick="toggleUserConnection(${sid}, '${escapeJs(c.client_id)}', '${escapeJs(proto)}', ${!enabled}, this)" title="${toggleTitle}">💡</button>
+                            <button class="btn btn-secondary btn-sm btn-icon" onclick="unlinkUserConnection(${sid}, '${escapeJs(c.client_id)}', '${escapeJs(proto)}', '${escapeJs(name)}')" title="${_('unlink_key_title').replace('{}', name).replace('{}', currentConnsUsername)}">✂️</button>
+                            <button class="btn btn-danger btn-sm btn-icon" onclick="removeUserConnection(${sid}, '${escapeJs(c.client_id)}', '${escapeJs(proto)}', '${escapeJs(name)}')" title="${_('delete')}">${ICON_TRASH}</button>
                         </div>
                     </div>
                 `;
             });
         } catch (err) {
             listEl.innerHTML = `<div style="color:#ef4444;padding:var(--space-md);">${_('error')}: ${err.message}</div>`;
+        }
+    }
+
+    async function unlinkUserConnection(serverId, clientId, proto, name) {
+        if (!confirm(_('unlink_confirm'))) return;
+        try {
+            await apiCall(`/api/users/${currentConnsUserId}/connections/unlink`, 'POST', {
+                server_id: serverId, protocol: proto, client_id: clientId,
+            });
+            showToast(_('conn_unlinked'), 'success');
+            viewUserConnections(currentConnsUserId, currentConnsUsername);
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    function lockConnRow(btn, lock) {
+        const row = btn ? btn.closest('.client-item') : null;
+        if (!row) return null;
+        row.classList.toggle('client-toggling', lock);
+        row.querySelectorAll('button').forEach(b => b.disabled = lock);
+        return row;
+    }
+
+    async function toggleUserConnection(serverId, clientId, proto, enable, btn) {
+        const original = btn.innerHTML;
+        lockConnRow(btn, true);
+        btn.innerHTML = '<span class="spinner"></span>';
+        try {
+            showToast(enable ? _('enable_connection_progress') : _('disable_connection_progress'), 'info');
+            await apiCall(`/api/servers/${serverId}/connections/toggle`, 'POST', {
+                protocol: proto, client_id: clientId, enable: enable,
+            });
+            showToast(enable ? _('connection_enabled') : _('connection_disabled'), 'success');
+            viewUserConnections(currentConnsUserId, currentConnsUsername);
+        } catch (err) {
+            lockConnRow(btn, false);
+            btn.innerHTML = original;
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    async function renameUserConnection(serverId, clientId, proto, oldName) {
+        const newName = prompt(_('rename'), oldName);
+        if (!newName || newName.trim() === '' || newName === oldName) return;
+        try {
+            await apiCall(`/api/servers/${serverId}/connections/rename`, 'POST', {
+                protocol: proto, client_id: clientId, new_name: newName.trim(),
+            });
+            showToast(_('success'), 'success');
+            viewUserConnections(currentConnsUserId, currentConnsUsername);
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        }
+    }
+
+    async function removeUserConnection(serverId, clientId, proto, name) {
+        if (!confirm(`${_('delete')}: ${name}?`)) return;
+        try {
+            await apiCall(`/api/servers/${serverId}/connections/remove`, 'POST', {
+                protocol: proto, client_id: clientId,
+            });
+            showToast(_('success'), 'success');
+            viewUserConnections(currentConnsUserId, currentConnsUsername);
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
         }
     }
 
@@ -822,15 +1099,89 @@
         const tabIdx = { conf: 0, vpn: 1, qr: 2 };
         tabs[tabIdx[tab]].classList.add('active');
         document.getElementById(panels[tab]).classList.add('active');
+        // the frame series only animates while its panel is on screen
+        if (tab === 'qr') { renderQR(); } else { stopQrAnimation(); }
     }
 
-    function generateQR(text) {
+    // The QR shows one of two payloads: Amnezia's own config format, split into
+    // the frame series ImportController::parseQrCodeChunk reassembles, or the
+    // raw config, which is all AmneziaWG and wg-quick understand. The series
+    // exists because a whole config in one code lands at QR version 21-26,
+    // while the Android scanner reads 640x480 camera frames and cannot decode
+    // anything that dense. Every frame below stays under 55x55 modules.
+    const QR_FRAME_MS = 800;
+
+    let currentQrConfig = '';
+    let currentQrChunks = [];
+    let currentQrFormat = 'amnezia';
+    let qrFrame = 0;
+    let qrTimer = null;
+
+    function setQrFormat(format) {
+        currentQrFormat = format;
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function generateQR(text, chunks) {
+        currentQrConfig = text || '';
+        currentQrChunks = chunks || [];
+        qrFrame = 0;
+        renderQR();
+    }
+
+    function stopQrAnimation() {
+        if (qrTimer) { clearInterval(qrTimer); qrTimer = null; }
+    }
+
+    function drawQr(text, size) {
         const container = document.getElementById('qrCode');
+        if (!container) return;
         container.innerHTML = '';
         try {
-            new QRCode(container, { text, width: 280, height: 280, colorDark: '#000000', colorLight: '#ffffff', correctLevel: QRCode.CorrectLevel.L });
+            new QRCode(container, {
+                text: text, width: size, height: size,
+                colorDark: '#000000', colorLight: '#ffffff',
+                correctLevel: QRCode.CorrectLevel.L
+            });
         } catch (e) {
-            container.innerHTML = `<div style="color:var(--text-muted);">${_('qr_error')}</div>`;
+            container.innerHTML = `<div style="color:var(--text-muted);font-size:0.85rem;">${_('qr_error')}</div>`;
+        }
+    }
+
+    function renderQR() {
+        stopQrAnimation();
+        const named = currentQrFormat === 'amnezia' && currentQrChunks.length > 0;
+        const switcher = document.getElementById('qrFormat');
+        if (switcher) {
+            switcher.classList.toggle('hidden', currentQrChunks.length === 0);
+            switcher.querySelectorAll('.qr-format-btn').forEach(b =>
+                b.classList.toggle('active', b.dataset.fmt === (named ? 'amnezia' : 'wireguard')));
+        }
+        const hint = document.getElementById('qrFormatHint');
+        if (!named) {
+            if (hint) hint.textContent = _('qr_format_wireguard_hint');
+            drawQr(currentQrConfig, qrSize(document.getElementById('qrCode') || document.body, 280));
+            return;
+        }
+        const paint = () => {
+            drawQr(currentQrChunks[qrFrame], qrSize(document.getElementById('qrCode') || document.body, 300));
+            if (hint) {
+                hint.textContent = currentQrChunks.length > 1
+                    ? `${_('qr_format_amnezia_hint')} ${qrFrame + 1}/${currentQrChunks.length}`
+                    : _('qr_format_amnezia_hint');
+            }
+        };
+        paint();
+        if (currentQrChunks.length > 1) {
+            qrTimer = setInterval(() => {
+                // the modal was closed or another tab opened -- offsetParent is
+                // null once the panel is off screen, so stop burning a timer
+                const container = document.getElementById('qrCode');
+                if (!container || !container.offsetParent) { stopQrAnimation(); return; }
+                qrFrame = (qrFrame + 1) % currentQrChunks.length;
+                paint();
+            }, QR_FRAME_MS);
         }
     }
     async function showUserConnectionConfig(serverId, clientId, protocol, connName) {
@@ -848,7 +1199,7 @@
                 document.getElementById('vpnLinkText').textContent = currentVpnLink;
                 switchConfigTab('conf');
                 openModal('configModal');
-                generateQR(result.config);
+                generateQR(result.config, result.vpn_qr_chunks);
             }
         } catch (err) {
             showToast(`${_('error')}: ` + err.message, 'error');
@@ -879,9 +1230,9 @@
 
             <div class="form-group">
                 <label class="form-label">{{ _('public_link_label') }}</label>
-                <div class="flex gap-sm">
+                <div class="flex gap-sm" style="flex-wrap: wrap;">
                     <input class="form-input" type="text" id="shareLink" readonly
-                        style="background: var(--bg-primary);">
+                        style="background: var(--bg-primary); flex: 1; min-width: 0;">
                     <button class="btn btn-secondary" onclick="copyShareLink()">📋</button>
                 </div>
             </div>
@@ -901,17 +1252,54 @@
 <script>
     let currentSharedUser = null;
 
+    function toDateTimeLocalValue(value) {
+        if (!value) return '';
+        const raw = String(value).trim();
+        if (!raw) return '';
+        const match = raw.match(/^(\d{4}-\d{2}-\d{2}T\d{2}:\d{2})/);
+        if (match) return match[1];
+        const parsed = new Date(raw);
+        if (Number.isNaN(parsed.getTime())) return '';
+        const offsetMs = parsed.getTimezoneOffset() * 60000;
+        return new Date(parsed.getTime() - offsetMs).toISOString().slice(0, 16);
+    }
+
     function openEditUser(data) {
         document.getElementById('editUserId').value = data.id;
         document.getElementById('editUserTitle').textContent = data.username;
+        document.getElementById('editUserName').value = data.username || '';
         document.getElementById('editUserTG').value = data.tg || '';
         document.getElementById('editUserEmail').value = data.email || '';
         document.getElementById('editUserDesc').value = data.desc || '';
         document.getElementById('editUserLimit').value = data.limit || '0';
         document.getElementById('editUserTrafficResetStrategy').value = data.strategy || 'never';
-        document.getElementById('editUserExpiration').value = data.expiration || '';
+        setDateTimeValue('editUserExpiration', 'editUserExpirationTime', data.expiration);
         document.getElementById('editUserPass').value = '';
         openModal('editUserModal');
+    }
+
+    async function resetUserTraffic() {
+        const uid = document.getElementById('editUserId').value;
+        if (!uid || !confirm(_('reset_traffic_confirm'))) return;
+
+        const btn = document.getElementById('resetTrafficBtn');
+        const text = document.getElementById('resetTrafficBtnText');
+        const spinner = document.getElementById('resetTrafficSpinner');
+        btn.disabled = true;
+        text.textContent = _('resetting');
+        spinner.classList.remove('hidden');
+
+        try {
+            await apiCall(`/api/users/${uid}/traffic/reset`, 'POST');
+            showToast(_('traffic_reset_success'), 'success');
+            refreshUsersList();
+        } catch (err) {
+            showToast(`${_('error')}: ` + err.message, 'error');
+        } finally {
+            btn.disabled = false;
+            text.textContent = _('reset_traffic');
+            spinner.classList.add('hidden');
+        }
     }
 
     async function saveEditUser() {
@@ -921,12 +1309,13 @@
         const spinner = document.getElementById('saveEditSpinner');
 
         const payload = {
+            username: document.getElementById('editUserName').value.trim(),
             telegramId: document.getElementById('editUserTG').value,
             email: document.getElementById('editUserEmail').value,
             description: document.getElementById('editUserDesc').value,
             traffic_limit: parseFloat(document.getElementById('editUserLimit').value || '0'),
             traffic_reset_strategy: document.getElementById('editUserTrafficResetStrategy').value,
-            expiration_date: document.getElementById('editUserExpiration').value || null,
+            expiration_date: getDateTimeValue('editUserExpiration', 'editUserExpirationTime'),
             password: document.getElementById('editUserPass').value || null
         };
 
