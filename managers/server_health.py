@@ -21,20 +21,43 @@ CAPTURE_SECONDS = 6
 MAX_NODES = 24
 TOTAL_BUDGET_SECONDS = 120
 
-# A SOCK_DGRAM packet socket strips the link header. Only IPv4 UDP packets with
-# our exact random payload are inspected; unrelated payloads are never printed.
+# A SOCK_DGRAM packet socket strips the link header. A socket-local BPF filter
+# rejects unrelated traffic in the kernel before the Python diagnostic sees it.
+# This is not a firewall filter and cannot alter the application's traffic.
 RECEIVER = r"""
-import json, socket, struct, sys, time
+import ctypes, json, socket, struct, sys, time
 port, seconds = int(sys.argv[1]), float(sys.argv[2])
 tokens = set(sys.argv[3:])
 s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
+class Filter(ctypes.Structure):
+    _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
+                ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
+class Program(ctypes.Structure):
+    _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(Filter))]
+# IPv4: UDP, unfragmented, requested destination port and payload prefix PVH_.
+# Offsets start at the IP header for SOCK_DGRAM; X is the variable IP header size.
+code = (Filter * 11)(
+    Filter(0x30, 0, 0, 9),          # ldb protocol
+    Filter(0x15, 0, 8, 17),         # reject unless UDP
+    Filter(0x28, 0, 0, 6),          # ldh fragmentation flags/offset
+    Filter(0x45, 6, 0, 0x3fff),     # reject fragments
+    Filter(0xb1, 0, 0, 0),          # X = 4 * IPv4 IHL
+    Filter(0x48, 0, 0, 2),          # ldh [X + 2]: UDP destination port
+    Filter(0x15, 0, 3, port),       # reject other ports
+    Filter(0x40, 0, 0, 8),          # ld [X + 8]: first four payload bytes
+    Filter(0x15, 0, 1, 0x5056485f), # reject non-probe payloads
+    Filter(0x06, 0, 0, 128),        # accept only a bounded prefix
+    Filter(0x06, 0, 0, 0),          # reject for this diagnostic socket only
+)
+program = Program(len(code), code)
+s.setsockopt(socket.SOL_SOCKET, 26, bytes(program))  # Linux SO_ATTACH_FILTER
 s.settimeout(.25)
 print(json.dumps({"ready": True}), flush=True)
 seen = set()
 end = time.monotonic() + seconds
 while time.monotonic() < end and seen != tokens:
     try:
-        p, meta = s.recvfrom(2048)
+        p, meta = s.recvfrom(128)
     except socket.timeout:
         continue
     if meta[2] == socket.PACKET_OUTGOING or len(p) < 28 or p[0] >> 4 != 4 or p[9] != 17:

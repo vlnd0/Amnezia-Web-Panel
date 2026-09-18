@@ -8,8 +8,10 @@ servers with an installed AWG protocol in the catalogue.
 SSH credentials are consumed inside the panel and never included in the
 response. No peer creation, daemon restart, firewall or DNS edits are performed.
 Linux/Python 3 are required remotely. Capture runs as root or through
-noninteractive `sudo -n`. Its packet socket inspects only IPv4 UDP packets whose
-destination port and random payload match the current probe. It does not write
+noninteractive `sudo -n`. Its socket-local kernel BPF filter admits only UDP
+packets for the probe port with the diagnostic marker prefix; Python then checks
+the full random payload. Normal application traffic is not copied into Python.
+This socket filter does not change firewall rules or application delivery. It does not write
 pcap files or return unrelated traffic. All SSH clients/channels are closed.
 
 Response fields:
@@ -27,6 +29,8 @@ Response fields:
 One result is shared for 30 seconds and concurrent callers coalesce behind a
 lock. SSH uses four workers with connection/banner/authentication deadlines.
 At most 24 servers are checked; incomplete inventory is explicitly flagged.
+SSH deadlines are explicit for diagnostics; normal provisioning keeps the
+pre-existing SSH timeout defaults.
 The total UDP work budget is 120 seconds including the initial SSH phase.
 Targets are checked sequentially to prevent source-channel contention from
 consuming another target's capture window. Each capture lasts at most 6 seconds.

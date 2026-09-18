@@ -11,6 +11,25 @@ from unittest.mock import Mock
 from managers import server_health as health
 
 
+def test_normal_ssh_connections_keep_existing_timeout_defaults(monkeypatch):
+    import paramiko
+
+    from managers.ssh_manager import SSHManager
+
+    client = Mock()
+    monkeypatch.setattr(paramiko, "SSHClient", lambda: client)
+    manager = SSHManager("example.test", 22, "root")
+    manager.connect()
+    kwargs = client.connect.call_args.kwargs
+    assert kwargs["timeout"] == 15
+    assert "auth_timeout" not in kwargs
+    assert "banner_timeout" not in kwargs
+
+    manager.connect(timeout=5)
+    kwargs = client.connect.call_args.kwargs
+    assert kwargs["timeout"] == kwargs["auth_timeout"] == kwargs["banner_timeout"] == 5
+
+
 def test_cancelled_http_request_keeps_lock_until_ssh_worker_finishes(monkeypatch):
     import app as panel
 
@@ -199,3 +218,34 @@ def test_real_packet_receiver_matches_only_probe_payload():
         if process.poll() is None:
             process.kill()
             process.wait()
+
+
+def test_diagnostic_filter_does_not_intercept_application_datagrams():
+    # A normal UDP application must continue receiving all its traffic while
+    # the diagnostic socket listens. This exercises the real Linux filter.
+    token = "PVH_app_coexistence"
+    with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as application:
+        application.bind(("127.0.0.1", 443))
+        application.settimeout(2)
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", health.RECEIVER, "443", "2", token],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+        try:
+            assert json.loads(process.stdout.readline()) == {"ready": True}
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                for index in range(100):
+                    payload = f"ordinary-application-data-{index}".encode()
+                    sender.sendto(payload, ("127.0.0.1", 443))
+                    assert application.recv(512) == payload
+                sender.sendto(token.encode(), ("127.0.0.1", 443))
+                assert application.recv(512) == token.encode()
+            output, errors = process.communicate(timeout=4)
+            assert process.returncode == 0, errors
+            assert json.loads(output)["received"] == [token]
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
