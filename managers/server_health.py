@@ -12,6 +12,7 @@ import shlex
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from datetime import datetime, timezone
 
 PROBE_NAMES = ("ru-01", "ru-02")
@@ -115,13 +116,42 @@ def _python(script, *args):
     )
 
 
+@contextmanager
+def _ssh_deadline(ssh, seconds):
+    """Close this diagnostic transport to interrupt Paramiko's unbounded waits.
+
+    Channel.settimeout only bounds I/O, not exec acknowledgement or exit-status
+    waits. Closing the owning client wakes both, including channels not yet
+    returned by exec_command. These clients are never shared with provisioning.
+    """
+    expired = threading.Event()
+
+    def close():
+        expired.set()
+        client = getattr(ssh, "client", None)
+        if client is not None:
+            client.close()
+
+    timer = threading.Timer(seconds, close)
+    timer.daemon = True
+    timer.start()
+    try:
+        yield
+    finally:
+        timer.cancel()
+        timer.join()
+    if expired.is_set():
+        raise TimeoutError("diagnostic_ssh_deadline")
+
+
 def _connect(server, ssh_factory):
     started = time.monotonic()
     ssh = None
     try:
         ssh = ssh_factory(server)
-        ssh.connect(timeout=SSH_TIMEOUT)
-        out, _, code = ssh.run_command("printf HEALTH_SSH_OK", timeout=SSH_TIMEOUT)
+        with _ssh_deadline(ssh, SSH_TIMEOUT):
+            ssh.connect(timeout=SSH_TIMEOUT)
+            out, _, code = ssh.run_command("printf HEALTH_SSH_OK", timeout=SSH_TIMEOUT)
         if code != 0 or out.strip() != "HEALTH_SSH_OK":
             raise RuntimeError("command_failed")
         return ssh, {
@@ -163,35 +193,36 @@ def probe_udp(target, target_ssh, sources):
         command = "sudo -n -- " + command
     stdout = None
     try:
-        stdin, stdout, stderr = target_ssh.client.exec_command(
-            command, timeout=SSH_TIMEOUT
-        )
-        stdin.close()
-        stdout.channel.settimeout(CAPTURE_SECONDS + SSH_TIMEOUT)
-        if json.loads(stdout.readline()).get("ready") is not True:
-            raise RuntimeError("capture_not_ready")
+        with _ssh_deadline(target_ssh, CAPTURE_SECONDS + 2 * SSH_TIMEOUT):
+            stdin, stdout, stderr = target_ssh.client.exec_command(
+                command, timeout=SSH_TIMEOUT
+            )
+            stdin.close()
+            stdout.channel.settimeout(CAPTURE_SECONDS + SSH_TIMEOUT)
+            if json.loads(stdout.readline()).get("ready") is not True:
+                raise RuntimeError("capture_not_ready")
 
-        def send(name):
-            ssh, lock = active[name]
-            try:
-                with lock:
-                    out, _, code = ssh.run_command(
-                        _python(SENDER, target["host"], UDP_PORT, tokens[name]),
-                        timeout=SSH_TIMEOUT,
-                    )
-                result = json.loads(out) if code == 0 else {}
-                return name, result if result.get("sent") is True else {}
-            except Exception:
-                return name, {}
+            def send(name):
+                ssh, lock = active[name]
+                try:
+                    with lock, _ssh_deadline(ssh, SSH_TIMEOUT):
+                        out, _, code = ssh.run_command(
+                            _python(SENDER, target["host"], UDP_PORT, tokens[name]),
+                            timeout=SSH_TIMEOUT,
+                        )
+                    result = json.loads(out) if code == 0 else {}
+                    return name, result if result.get("sent") is True else {}
+                except Exception:
+                    return name, {}
 
-        with ThreadPoolExecutor(max_workers=2) as pool:
-            sent = dict(pool.map(send, active))
-        payload = json.loads(stdout.readline())
-        if stdout.channel.recv_exit_status() != 0:
-            raise RuntimeError("capture_failed")
-        received = payload.get("received")
-        if not isinstance(received, list):
-            raise RuntimeError("capture_invalid")
+            with ThreadPoolExecutor(max_workers=2) as pool:
+                sent = dict(pool.map(send, active))
+            payload = json.loads(stdout.readline())
+            if stdout.channel.recv_exit_status() != 0:
+                raise RuntimeError("capture_failed")
+            received = payload.get("received")
+            if not isinstance(received, list):
+                raise RuntimeError("capture_invalid")
         for name in active:
             if tokens[name] in received:
                 results[name] = {"status": "received"}
@@ -249,7 +280,7 @@ def collect_health(servers, ssh_factory):
         for index in targets:
             if (
                 time.monotonic() - started
-                > TOTAL_BUDGET_SECONDS - CAPTURE_SECONDS - SSH_TIMEOUT
+                > TOTAL_BUDGET_SECONDS - CAPTURE_SECONDS - 2 * SSH_TIMEOUT
             ):
                 rows[index]["udp"] = {
                     name: {"status": "unknown", "reason": "budget_exceeded"}

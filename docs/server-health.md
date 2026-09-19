@@ -31,6 +31,11 @@ lock. SSH uses four workers with connection/banner/authentication deadlines.
 At most 24 servers are checked; incomplete inventory is explicitly flagged.
 SSH deadlines are explicit for diagnostics; normal provisioning keeps the
 pre-existing SSH timeout defaults.
+Each diagnostic SSH operation also has a watchdog that closes its dedicated
+transport on deadline. This interrupts exec-acknowledgement and exit-status
+waits, which Paramiko's channel I/O timeout alone does not bound. Failed or
+stalled diagnostics cannot keep the health lock occupied indefinitely waiting
+for a command's exit status.
 The total UDP work budget is 120 seconds including the initial SSH phase.
 Targets are checked sequentially to prevent source-channel contention from
 consuming another target's capture window. Each capture lasts at most 6 seconds.
