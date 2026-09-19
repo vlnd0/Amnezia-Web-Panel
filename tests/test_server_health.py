@@ -25,9 +25,45 @@ def test_normal_ssh_connections_keep_existing_timeout_defaults(monkeypatch):
     assert "auth_timeout" not in kwargs
     assert "banner_timeout" not in kwargs
 
+    manager.disconnect()
     manager.connect(timeout=5)
     kwargs = client.connect.call_args.kwargs
     assert kwargs["timeout"] == kwargs["auth_timeout"] == kwargs["banner_timeout"] == 5
+
+
+def test_diagnostics_use_private_transport_without_implicit_reconnect(monkeypatch):
+    import app as panel
+
+    pooled = Mock()
+    monkeypatch.setattr(panel, "_SSH_POOL", {("example.test", 22, "root"): pooled})
+    ssh = panel.get_diagnostic_ssh({"host": "example.test", "username": "root"})
+    assert ssh is not pooled
+    assert ssh.client is None
+    ssh.client = Mock()
+    ssh.client.exec_command.side_effect = EOFError("deadline closed transport")
+    ssh.connect = Mock(side_effect=AssertionError("diagnostics must not reconnect"))
+    assert ssh.run_command("test", timeout=1)[2] == -1
+    ssh.connect.assert_not_called()
+    ssh.disconnect()
+    pooled.close.assert_not_called()
+
+
+def test_explicit_diagnostic_timeout_does_not_retry_connect(monkeypatch):
+    import pytest
+    from managers.ssh_manager import SSHManager
+
+    ssh = SSHManager("example.test", 22, "root", auto_reconnect=False)
+    connect = Mock(side_effect=TimeoutError("deadline"))
+    monkeypatch.setattr(ssh, "_connect_once", connect)
+    with pytest.raises(TimeoutError):
+        ssh.connect(timeout=5)
+    connect.assert_called_once_with(timeout=5)
+
+
+def test_health_includes_awg3_and_its_instances():
+    assert health.is_awg_server({"protocols": {"awg3": {"installed": True}}})
+    assert health.is_awg_server({"protocols": {"awg3__2": {"installed": True}}})
+    assert not health.is_awg_server({"protocols": {"awg3": {"installed": False}}})
 
 
 def test_cancelled_http_request_keeps_lock_until_ssh_worker_finishes(monkeypatch):
@@ -81,7 +117,7 @@ def test_health_api_authorization_and_cached_read(monkeypatch):
     monkeypatch.setattr(panel, "_check_admin", lambda request: {"role": "admin"})
     assert client.get("/api/health/servers").status_code == 200
     assert client.get("/api/health/servers").status_code == 200
-    collect.assert_called_once()
+    collect.assert_called_once_with([], panel.get_diagnostic_ssh)
 
 
 def target_ssh(lines):

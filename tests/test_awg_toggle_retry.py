@@ -1,4 +1,4 @@
-"""Review regression: retry must reconcile persisted and running peer state."""
+"""Retry must reconcile persisted and running peer state."""
 
 import json
 from unittest.mock import Mock

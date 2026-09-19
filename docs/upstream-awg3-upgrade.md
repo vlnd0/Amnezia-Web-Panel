@@ -14,6 +14,11 @@ not require reinstalling protocols or regenerating existing client keys.
 - Full AWG/WireGuard/Telemt manager operations are serialized per SSH session;
   different nodes remain concurrent. Repeated connect calls keep an active
   pooled transport. Failed metadata reads abort instead of overwriting clients.
+- Retrying enable after a failed `syncconf` reapplies the persisted peer before
+  reporting success. This prevents renewal from leaving a paid peer disabled.
+- Server-health diagnostics use separate SSH transports with bounded connect
+  and command lifetimes. Their timeouts cannot close a provisioning transport;
+  diagnostics also recognize AWG3 instances.
 - Numeric server IDs remain list indices. Reordering/deleting servers is
   blocked by default (`PRESERVE_SERVER_IDS=on`); add new nodes at the end.
   Do not disable this protection while the bot uses numeric IDs.
@@ -64,7 +69,8 @@ docker build -f Dockerfile.test -t amnezia-panel-tests .
 docker run --rm --network none amnezia-panel-tests
 ```
 
-CI uses the same image. It runs undefined-name checks and pytest, including
+The default test image uses production's Python 3.14. CI also tests Python 3.11
+with `--build-arg PYTHON_VERSION=3.11`. It runs undefined-name checks and pytest, including
 upstream's unittest suites and the fork's existing on-link regressions. Browser
 E2E needs a running disposable panel and Playwright browser dependencies; it is
 separate from these offline tests.

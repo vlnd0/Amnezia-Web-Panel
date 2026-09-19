@@ -16,13 +16,14 @@ class SSHManager:
     """Manages SSH connections and command execution on remote servers."""
 
     def __init__(self, host, port, username, password=None, private_key=None,
-                 connect_cooldown_base=30.0):
+                 connect_cooldown_base=30.0, auto_reconnect=True):
         self.host = host
         self.port = int(port)
         self.username = username
         self.password = password
         self.private_key = private_key
         self.client = None
+        self.auto_reconnect = auto_reconnect
         self._is_root = (username == 'root')
         # Serializes connect/disconnect so concurrent threads (UI request
         # handler + background monitor) cannot race a half-built transport.
@@ -203,7 +204,10 @@ class SSHManager:
         return str(exc).strip() or type(exc).__name__
 
     def _run_command_locked(self, command, timeout, _retried, stdin_input=None):
-        self.ensure_connected()
+        if self.auto_reconnect:
+            self.ensure_connected()
+        elif self.client is None:
+            raise ConnectionError("Not connected to server")
 
         logger.info(f"Running command: {command[:100]}...")
         try:
@@ -211,7 +215,7 @@ class SSHManager:
         except Exception as e:
             # Transport can be dead while is_active() still claims otherwise
             # (silent NAT drop). Reconnect once and retry before giving up.
-            if not _retried:
+            if not _retried and self.auto_reconnect:
                 logger.warning(f"exec failed ({e}); reconnecting and retrying once")
                 try:
                     self.force_disconnect()

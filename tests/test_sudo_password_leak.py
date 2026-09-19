@@ -53,6 +53,7 @@ class FakeStdin(FakeStream):
 
 def make_ssh():
     ssh = SSHManager.__new__(SSHManager)
+    ssh.auto_reconnect = True
     ssh._exec_lock = threading.RLock()
     ssh._is_root = False
     ssh.password = PASSWORD

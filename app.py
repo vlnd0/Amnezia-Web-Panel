@@ -324,6 +324,18 @@ def drop_ssh(server):
             pass
 
 
+def get_diagnostic_ssh(server):
+    """Private transport: diagnostic deadlines must never close a pooled one."""
+    return SSHManager(
+        host=server['host'],
+        port=server.get('ssh_port', 22),
+        username=server['username'],
+        password=server.get('password'),
+        private_key=server.get('private_key'),
+        auto_reconnect=False,
+    )
+
+
 def get_panel_local_url(request: Optional[Request] = None):
     data = load_data()
     ssl_conf = data.get('settings', {}).get('ssl', {})
@@ -2925,7 +2937,7 @@ async def api_server_health(request: Request):
             return _HEALTH_CACHE
         from managers.server_health import collect_health
         servers = load_data().get('servers', [])
-        worker = asyncio.create_task(asyncio.to_thread(collect_health, servers, get_ssh))
+        worker = asyncio.create_task(asyncio.to_thread(collect_health, servers, get_diagnostic_ssh))
         try:
             result = await asyncio.shield(worker)
         except asyncio.CancelledError:
