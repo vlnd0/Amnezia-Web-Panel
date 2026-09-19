@@ -2812,6 +2812,9 @@ PersistentKeepalive = 25
             psk = ud.get('psk', '')
             current_peer = self._parse_peers_from_config(protocol_type).get(client_id)
             if current_peer:
+                # A previous enable may have persisted the peer but failed to
+                # apply it. Reconcile the running interface before confirming.
+                self._sync_config(protocol_type)
                 ud['enabled'] = True
                 self._save_clients_table(protocol_type, clients_table)
                 return
