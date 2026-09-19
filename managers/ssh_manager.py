@@ -23,8 +23,12 @@ class SSHManager:
         self.client = None
         self._is_root = (username == 'root')
 
-    def connect(self):
-        """Establish SSH connection to the server."""
+    def connect(self, timeout=None):
+        """Establish SSH connection; explicit deadlines are for diagnostics.
+
+        Omitted timeout preserves the existing transport/auth defaults used by
+        provisioning and other panel operations.
+        """
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
 
@@ -32,10 +36,13 @@ class SSHManager:
             'hostname': self.host,
             'port': self.port,
             'username': self.username,
-            'timeout': 15,
+            'timeout': 15 if timeout is None else timeout,
             'allow_agent': False,
             'look_for_keys': False,
         }
+        if timeout is not None:
+            kwargs['banner_timeout'] = timeout
+            kwargs['auth_timeout'] = timeout
 
         if self.private_key:
             key_file = io.StringIO(self.private_key)

@@ -1783,6 +1783,38 @@ async def api_login(request: Request, req: LoginRequest):
 
 # ======================== SERVER API (admin/support) ========================
 
+_HEALTH_LOCK = asyncio.Lock()
+_HEALTH_CACHE = None
+_HEALTH_CACHE_AT = 0.0
+
+
+@app.get('/api/health/servers', tags=["Servers"])
+async def api_server_health(request: Request):
+    """SSH authentication + UDP/443 delivery from ru-01 and ru-02.
+
+    Uses stored server credentials internally; never returns credentials or
+    captured traffic. Results are shared for 30s to bound diagnostic load.
+    """
+    global _HEALTH_CACHE, _HEALTH_CACHE_AT
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    async with _HEALTH_LOCK:
+        if _HEALTH_CACHE is not None and time.monotonic() - _HEALTH_CACHE_AT < 30:
+            return _HEALTH_CACHE
+        from managers.server_health import collect_health
+        servers = load_data().get('servers', [])
+        worker = asyncio.create_task(asyncio.to_thread(collect_health, servers, get_ssh))
+        try:
+            result = await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            # Disconnecting HTTP clients must not release the lock while SSH
+            # threads are still running and allow another diagnostic stampede.
+            await worker
+            raise
+        _HEALTH_CACHE = result
+        _HEALTH_CACHE_AT = time.monotonic()
+        return result
+
 def _check_admin(request):
     """Authorize an admin/support action via session cookie OR Bearer token.
 
