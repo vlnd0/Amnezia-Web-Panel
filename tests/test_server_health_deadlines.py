@@ -108,7 +108,7 @@ def test_health_lock_is_reusable_after_stalled_ssh(monkeypatch, stalled_channel)
     monkeypatch.setattr(panel, "_HEALTH_CACHE", None)
     monkeypatch.setattr(panel, "_check_admin", lambda _: True)
     monkeypatch.setattr(panel, "load_data", lambda: {"servers": [{"name": "test"}]})
-    monkeypatch.setattr(panel, "get_ssh", lambda _: stalled_ssh(stalled_channel))
+    monkeypatch.setattr(panel, "get_diagnostic_ssh", lambda _: stalled_ssh(stalled_channel))
 
     async def scenario():
         monkeypatch.setattr(panel, "_HEALTH_LOCK", asyncio.Lock())

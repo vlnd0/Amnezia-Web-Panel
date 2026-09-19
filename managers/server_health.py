@@ -103,7 +103,7 @@ def is_awg_server(server):
     return any(
         info.get("installed")
         for name, info in server.get("protocols", {}).items()
-        if name in ("awg", "awg2", "awg_legacy") and isinstance(info, dict)
+        if name.split('__', 1)[0] in ("awg", "awg2", "awg3", "awg_legacy") and isinstance(info, dict)
     )
 
 

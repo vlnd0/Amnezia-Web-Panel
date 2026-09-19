@@ -1,0 +1,5 @@
+data.json
+.git
+.pytest_cache
+__pycache__
+*.pyc

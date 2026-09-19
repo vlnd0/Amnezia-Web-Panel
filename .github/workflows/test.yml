@@ -1,0 +1,27 @@
+name: Tests
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  unittest:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    strategy:
+      matrix:
+        python: ["3.11", "3.14"]
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Build test image
+      run: docker build --build-arg PYTHON_VERSION=${{ matrix.python }} -f Dockerfile.test -t amnezia-panel-tests .
+
+    - name: Run offline regression tests and undefined-name checks
+      run: docker run --rm --network none amnezia-panel-tests
