@@ -51,8 +51,8 @@ class SSHManager:
         # otherwise every API request kills the shared transport.
         self.pooled = False
 
-    def connect(self):
-        """Establish SSH connection to the server."""
+    def connect(self, timeout=None):
+        """Reuse the live transport; explicit deadlines bound diagnostics."""
         with self._exec_lock, self._conn_lock:
             transport = self.client.get_transport() if self.client else None
             if transport and transport.is_active():
@@ -62,9 +62,9 @@ class SSHManager:
             # (e.g. transcontinental/DPI-filtered routes) drop ~half of the
             # first attempts while the retry succeeds in milliseconds.
             last_exc = None
-            for attempt in (1, 2):
+            for attempt in ((1, 2) if timeout is None else (1,)):
                 try:
-                    self._connect_once()
+                    self._connect_once(timeout=timeout)
                     last_exc = None
                     break
                 except (TimeoutError, OSError) as e:
@@ -94,7 +94,7 @@ class SSHManager:
         self._connect_cooldown = self._connect_cooldown_base
         self._last_connect_fail = 0.0
 
-    def _connect_once(self):
+    def _connect_once(self, timeout=None):
         """Single TCP+SSH handshake attempt (caller holds _conn_lock)."""
         self.client = paramiko.SSHClient()
         self.client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -103,10 +103,13 @@ class SSHManager:
             'hostname': self.host,
             'port': self.port,
             'username': self.username,
-            'timeout': 15,
+            'timeout': 15 if timeout is None else timeout,
             'allow_agent': False,
             'look_for_keys': False,
         }
+        if timeout is not None:
+            kwargs['banner_timeout'] = timeout
+            kwargs['auth_timeout'] = timeout
 
         if self.private_key:
             key_file = io.StringIO(self.private_key)
