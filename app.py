@@ -2662,7 +2662,7 @@ def _scrape_server_traffic(server, sid, my_conns):
                     rx = c.get('userData', {}).get('dataReceivedBytes', 0)
                     tx = c.get('userData', {}).get('dataSentBytes', 0)
                     client_bytes[c.get('clientId')] = rx + tx
-                    
+
                 for uc in my_conns:
                     if uc['protocol'] == proto and uc['client_id'] in client_bytes:
                         curr_bytes = client_bytes[uc['client_id']]
