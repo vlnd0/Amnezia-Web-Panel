@@ -1115,6 +1115,10 @@ done
         # Step 3: Remove old container if exists
         if self.check_protocol_installed(protocol_type):
             results.append("Removing old container...")
+            # AWG containers keep /opt/amnezia/awg (peers, keys, clientsTable)
+            # INSIDE the container - there is no bind mount, so docker rm is
+            # irreversible data loss. Snapshot it to the host first.
+            self._backup_container_state(container_name, results)
             self.remove_container(protocol_type)
             results.append("Old container removed")
 
@@ -1933,6 +1937,29 @@ x_exit_sync() {
         self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
         self.ssh.run_sudo_command(f"docker rmi {container_name}")
         return True
+
+    def _backup_container_state(self, container_name, results=None):
+        """Snapshot the container's /opt/amnezia/awg to a timestamped host dir.
+
+        AWG containers have no bind mount for their state, so removing the
+        container destroys every peer. Called before any destructive remove;
+        failures are reported but never block the install (the admin sees the
+        warning line in the install log)."""
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        dest = f"/opt/amnezia/backups/{container_name}-{ts}"
+        out, err, code = self.ssh.run_sudo_command(
+            f"mkdir -p /opt/amnezia/backups && "
+            f"docker cp {container_name}:/opt/amnezia/awg {dest}"
+        )
+        if code == 0:
+            msg = f"Peer state backed up to {dest}"
+        else:
+            msg = (f"! Peer state backup of {container_name} FAILED: "
+                   f"{((err or out) or '').strip()[:200]}")
+        logger.info(f"_backup_container_state: {msg}")
+        if results is not None:
+            results.append(msg)
+        return code == 0
 
     # ===================== CLIENT MANAGEMENT =====================
 
