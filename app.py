@@ -3428,6 +3428,15 @@ def api_check_server(request: Request, server_id: int):
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
 
         protocols_to_check = list(dict.fromkeys(BASE_PROTOCOLS + list(server.get('protocols', {}).keys())))
+        # One batched round trip for all AWG containers (ps snapshot + configs
+        # + clientsTables) instead of 3-5 SSH commands per instance - this is
+        # what made /check take seconds on high-latency servers.
+        try:
+            awg_protos = [p for p in protocols_to_check if protocol_base(p) in AWG_PROTOCOLS]
+            if awg_protos:
+                AWGManager(ssh).prefetch_awg_state(awg_protos)
+        except Exception as e:
+            logger.warning(f"AWG status prefetch failed, falling back to per-instance checks: {e}")
         # Run checks sequentially. Several managers use the same SSH connection;
         # checking them in parallel through one SSH object can produce false
         # negatives and previously caused dynamic AWG instances to be removed.
@@ -4407,6 +4416,8 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
         else:
             ssh.run_sudo_command(f"docker start {container}")
             action = 'started'
+        if hasattr(ssh, 'docker_ps_invalidate'):
+            ssh.docker_ps_invalidate()
         ssh.disconnect()
         return {'status': 'success', 'action': action, 'container': container}
     except Exception as e:
