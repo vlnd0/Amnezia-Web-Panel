@@ -126,6 +126,101 @@ class PrefetchAwgStateTest(unittest.TestCase):
         self.assertEqual(batch_cmds, [])
         self.assertEqual(mgr._get_clients_table('awg2'), [])
 
+    def test_corrupt_prefetched_clients_falls_back_to_direct_read(self):
+        """A truncated batch read (flaky link) must not show up as 0 peers."""
+        ssh = FakeSSH()
+        ssh.batch_output = (
+            "@@CONTAINER@@ amnezia-awg2\n"
+            "[Interface]\nListenPort = 55424\n"
+            "@@CLIENTS@@\n"
+            '[{"clientId": "PEER_A", "userData": {"clie'  # cut off mid-JSON
+        )
+        mgr = AWGManager(ssh)
+        mgr.prefetch_awg_state(['awg2'])
+
+        clients = mgr._get_clients_table('awg2')
+        # direct read returns '[]' in FakeSSH, but the point is the retry happened
+        self.assertEqual(clients, [])
+        self.assertNotIn('amnezia-awg2', ssh._awg_batch['containers'])
+        direct = [c for c in ssh.commands
+                  if 'clientsTable' in c and not c.startswith('for c in ')]
+        self.assertEqual(len(direct), 1)
+
+    def test_corrupt_direct_clients_read_raises_instead_of_zero(self):
+        ssh = FakeSSH()
+        ssh.ps_output = "amnezia-awg2\trunning\n"   # direct path, container up
+        ssh.commands = ssh.commands
+        mgr = AWGManager(ssh)
+        # make the direct read return garbage
+        orig = ssh.run_sudo_command
+        def garbage(cmd, timeout=60):
+            if 'clientsTable' in cmd and 'docker exec' in cmd:
+                return '[{"clientId": "BROKEN"', '', 0
+            return orig(cmd, timeout)
+        ssh.run_sudo_command = garbage
+        with self.assertRaises(RuntimeError):
+            mgr._get_clients_table('awg2')
+
+    def test_stopped_container_reads_nothing(self):
+        """A stopped instance must not be exec-polled on every refresh."""
+        ssh = FakeSSH()
+        ssh.ps_output = "amnezia-awg2\texited\n"
+        mgr = AWGManager(ssh)
+        self.assertEqual(mgr._get_clients_table('awg2'), [])
+        exec_cmds = [c for c in ssh.commands
+                     if 'docker exec' in c and not c.startswith('for c in ')]
+        self.assertEqual(exec_cmds, [])
+
+    def test_unreadable_existing_table_raises(self):
+        """Running container, table exists, cat fails -> honest error."""
+        ssh = FakeSSH()
+        ssh.ps_output = "amnezia-awg2\trunning\n"
+        orig = ssh.run_sudo_command
+        def broken_cat(cmd, timeout=60):
+            if 'cat /opt/amnezia/awg/clientsTable' in cmd:
+                return '', '', 1
+            if 'test -f' in cmd:
+                return '', '', 0
+            return orig(cmd, timeout)
+        ssh.run_sudo_command = broken_cat
+        mgr = AWGManager(ssh)
+        with self.assertRaises(RuntimeError):
+            mgr._get_clients_table('awg2')
+
+    def test_fresh_instance_without_table_is_empty(self):
+        """Running container, no clientsTable yet -> empty, not an error."""
+        ssh = FakeSSH()
+        ssh.ps_output = "amnezia-awg2\trunning\n"
+        orig = ssh.run_sudo_command
+        def no_file(cmd, timeout=60):
+            if 'cat /opt/amnezia/awg/clientsTable' in cmd:
+                return '', '', 1
+            if 'test -f' in cmd:
+                return '', '', 1
+            return orig(cmd, timeout)
+        ssh.run_sudo_command = no_file
+        mgr = AWGManager(ssh)
+        self.assertEqual(mgr._get_clients_table('awg2'), [])
+
+    def test_status_counts_conf_only_peers_as_connections(self):
+        """clients_count must include peers that exist only in awg0.conf
+        (the ones the list renders as 'External')."""
+        ssh = FakeSSH()
+        ssh.ps_output = "amnezia-awg2\trunning\n"
+        ssh.batch_output = (
+            "@@CONTAINER@@ amnezia-awg2\n"
+            "[Interface]\nPrivateKey = SRV\nListenPort = 55424\n\n"
+            "[Peer]\nPublicKey = PEER_A\nAllowedIPs = 10.8.1.2/32\n\n"
+            "[Peer]\nPublicKey = PEER_EXT\nAllowedIPs = 10.8.1.9/32\n"
+            "@@CLIENTS@@\n"
+            '[{"clientId": "PEER_A", "userData": {"clientName": "alice"}}]\n'
+        )
+        mgr = AWGManager(ssh)
+        mgr.prefetch_awg_state(['awg2'])
+        info = mgr.get_server_status('awg2')
+        self.assertEqual(info['clients_count'], 2)
+        self.assertEqual(info['external_count'], 1)
+
 
 if __name__ == '__main__':
     unittest.main()

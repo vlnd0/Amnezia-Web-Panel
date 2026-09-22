@@ -1104,7 +1104,13 @@ AllowedIPs = {client_ip}/32
                         if 'ListenPort' in line:
                             info['port'] = line.split('=')[1].strip()
                             break
-                    info['clients_count'] = len(self._get_clients_table())
+                    # Count conf-only peers too (they render as 'External'):
+                    # the table alone understates the real peer count.
+                    clients = self._get_clients_table()
+                    known = {c.get('clientId') for c in clients}
+                    conf_peers = self._parse_peers_from_config()
+                    info['clients_count'] = len(known | set(conf_peers))
+                    info['external_count'] = len(set(conf_peers) - known)
                 except Exception as e:
                     info['error'] = str(e)
 
