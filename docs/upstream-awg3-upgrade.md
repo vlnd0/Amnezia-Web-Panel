@@ -60,6 +60,22 @@ No deployment, production migration or real-node installation is performed
 by this PR. Unit/API tests use fake transports; an actual AWG3 handshake is a
 separate rollout gate.
 
+## AWG3 MTU and dual-stack address allocation
+
+New AWG3 installations default to MTU 1280 for both client exports and the
+server interface. Changing AWG3 MTU in the settings persists it in the server
+config and applies it without restarting the container. Existing imported
+client profiles need a new export to pick up the client MTU. AWG2 and legacy
+MTU defaults and settings retain their previous behavior.
+
+New dual-stack peers derive IPv6 from the entire IPv4 host offset. The allocator
+reserves the server IPv6, native peers, and disabled peers, so the first client
+cannot take the gateway address and crossing an IPv4 octet boundary cannot
+reuse IPv6. Existing stored/native assignments stay intact during config
+export and re-enabling. An already issued gateway collision requires moving
+the server gateway to an unused address in the same IPv6 prefix; deploying
+the panel alone does not change existing node addresses or keys.
+
 ## Verification
 
 Use Docker for all Python checks:

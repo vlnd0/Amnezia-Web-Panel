@@ -82,6 +82,7 @@ AWG3_CONFIG_KEYS = tuple(config_key for _, config_key in AWG3_PARAM_MAP)
 # checks in netlink.c. Below that `awg setconf` fails with a bare
 # "Invalid argument": the explanation only goes to net_dbg_ratelimited.
 AWG3_MIN_JUNK_SIZE = 12
+AWG3_DEFAULT_MTU = '1280'
 
 # AWG 3.1 keys only exist in amneziawg kernel module 3.0+ (the 1.0.x line the
 # Amnezia PPA still ships predates them). awg-quick prefers the host module and
@@ -535,22 +536,73 @@ class AWGManager:
             pass
         return ''
 
-    def _get_client_ipv6(self, protocol_type, client_ip):
+    def _get_client_ipv6(self, protocol_type, client_ip, legacy=False):
         """Derive a client's IPv6 address from its IPv4 address.
 
-        The last hextet mirrors the IPv4 last octet (in hex), so every client
-        with 10.8.1.N deterministically gets <prefix>::<hex(N)>. Returns ''
-        when the server tunnel has no IPv6 gateway configured.
+        New peers use the entire IPv4 host offset, so crossing an octet
+        boundary cannot reuse an IPv6 address. Legacy reconstruction keeps
+        the old last-octet mapping when no stored assignment is available.
         """
         gateway = self._get_subnet_ipv6_ip(protocol_type)
         if not gateway:
             return ''
         try:
-            octet = int(client_ip.split('.')[3])
-        except (ValueError, IndexError, AttributeError):
+            ip = ipaddress.IPv4Address(client_ip)
+            network = self._get_subnet(protocol_type)
+            if ip not in network:
+                return ''
+            if legacy:
+                return f"{gateway.rsplit(':', 1)[0]}:{int(ip) & 255:x}"
+            offset = int(ip) - int(network.network_address)
+            network6 = ipaddress.ip_network(f'{gateway}/64', strict=False)
+            for line in self._get_server_config(protocol_type).splitlines():
+                if line.strip().startswith('Address') and '=' in line:
+                    for part in line.split('=', 1)[1].split(','):
+                        if ':' in part:
+                            network6 = ipaddress.ip_interface(part.strip()).network
+            if offset >= network6.num_addresses:
+                raise RuntimeError('AWG IPv6 subnet is exhausted')
+            return str(network6.network_address + offset)
+        except (ValueError, TypeError):
             return ''
-        prefix = gateway.rsplit(':', 1)[0] + ':'
-        return f"{prefix}{octet:x}"
+
+    @staticmethod
+    def _ipv6_networks(value):
+        result = []
+        for part in str(value or '').replace(',', ' ').split():
+            try:
+                network = ipaddress.ip_network(part, strict=False)
+            except ValueError:
+                continue
+            if network.version == 6:
+                result.append(network)
+        return result
+
+    def _get_existing_client_ipv6(self, protocol_type, client_id, user_data, client_ip):
+        if user_data.get('clientIpv6'):
+            return user_data['clientIpv6']
+        peer = self._parse_peers_from_config(protocol_type).get(client_id, {})
+        for value in (user_data.get('allowedIps'), peer.get('allowedIps')):
+            networks = self._ipv6_networks(value)
+            if networks:
+                return str(networks[0].network_address)
+        return self._get_client_ipv6(protocol_type, client_ip, legacy=True)
+
+    def _get_reserved_ipv6(self, protocol_type):
+        gateway = self._get_subnet_ipv6_ip(protocol_type)
+        if not gateway:
+            return []
+        reserved = self._ipv6_networks(gateway)
+        for peer in self._parse_peers_from_config(protocol_type).values():
+            reserved.extend(self._ipv6_networks(peer.get('allowedIps')))
+        for client in self._get_clients_table(protocol_type):
+            ud = client.get('userData') or {}
+            reserved.extend(self._ipv6_networks(ud.get('clientIpv6')))
+            reserved.extend(self._ipv6_networks(ud.get('allowedIps')))
+        return reserved
+
+    def _default_mtu(self, protocol_type):
+        return AWG3_DEFAULT_MTU if self._base_protocol(protocol_type) == self.AWG3 else AWG_DEFAULTS['mtu']
 
     def _detect_server_ipv6(self, protocol_type=None):
         """Decide whether the tunnel should be dual-stack.
@@ -992,7 +1044,7 @@ done
                 awg_params.pop(key, None)
             awg_params.update(normalize_special_junk(special_junk))
 
-        mtu = str(mtu or AWG_DEFAULTS['mtu']).strip()
+        mtu = str(mtu or self._default_mtu(protocol_type)).strip()
         dns = (dns or '').strip() or self._default_dns()
 
         container_name = self._container_name(protocol_type)
@@ -1201,14 +1253,17 @@ done
             if awg_params.get(param_key)
         )
 
-        # MTU and DNS belong to the generated client configs, not to the
-        # server interface, so they are stored as comments: awg-quick would
-        # otherwise resize the server tunnel and call resolvconf, which the
-        # container does not have. _get_mtu/_get_dns read them back.
+        # DNS stays commented to avoid resolvconf on the server. Legacy
+        # MTU defaults affect client exports only; AWG3 also sizes its server
+        # interface explicitly to leave room for its extra transport padding.
         client_defaults_lines = (
-            f"# MTU = {mtu or AWG_DEFAULTS['mtu']}\n"
+            f"# MTU = {mtu or self._default_mtu(protocol_type)}\n"
             f"# DNS = {dns or self._default_dns()}\n"
         )
+        if self._base_protocol(protocol_type) == self.AWG3:
+            # AWG3 transport padding can fragment the old 1420-byte server
+            # interface even when the client uses a smaller MTU.
+            client_defaults_lines += f"MTU = {mtu or self._default_mtu(protocol_type)}\n"
         # IPv6 DNS for dual-stack tunnels, stored the same comment way;
         # _get_dns6 reads it back when building client configs.
         if ipv6:
@@ -2174,9 +2229,14 @@ done < "$BW"
             except ValueError:
                 continue
 
+        reserved_ipv6 = self._get_reserved_ipv6(protocol_type)
         for host in network.hosts():
             if host in used:
                 continue
+            if reserved_ipv6:
+                ip6 = ipaddress.ip_address(self._get_client_ipv6(protocol_type, str(host)))
+                if any(ip6 in subnet for subnet in reserved_ipv6):
+                    continue
             return str(host)
 
         raise RuntimeError(
@@ -2713,7 +2773,7 @@ PersistentKeepalive = 25
         client_ip = self._client_ip_from_userdata(ud) or ''
         psk = ud.get('psk', '')
         # Dual-stack: use the stored IPv6 or derive it from the IPv4 address
-        client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
+        client_ipv6 = self._get_existing_client_ipv6(protocol_type, client_id, ud, client_ip)
 
         if not client_priv_key:
             raise RuntimeError("Client private key not stored. Config cannot be reconstructed.")
@@ -2839,7 +2899,8 @@ PersistentKeepalive = 25
                     raise RuntimeError(
                         f"Cannot enable client: IP {client_ip} is already "
                         f"present in the active server config")
-            if not client_ip:
+            assigned_new_ip = not client_ip
+            if assigned_new_ip:
                 client_ip = self._get_next_ip(protocol_type)
                 logger.warning(
                     "Client %s had no saved AWG IP/AllowedIPs; assigning next free IP %s",
@@ -2849,7 +2910,8 @@ PersistentKeepalive = 25
 
             self._ensure_subnet_nat(protocol_type, self._get_subnet(protocol_type))
             ud['clientIp'] = client_ip
-            client_ipv6 = ud.get('clientIpv6', '') or self._get_client_ipv6(protocol_type, client_ip)
+            client_ipv6 = (self._get_client_ipv6(protocol_type, client_ip) if assigned_new_ip
+                           else self._get_existing_client_ipv6(protocol_type, client_id, ud, client_ip))
             allowed_ips = f'{client_ip}/32' + (f', {client_ipv6}/128' if client_ipv6 else '')
             ud['allowedIps'] = allowed_ips
             if client_ipv6:
@@ -3054,8 +3116,8 @@ AllowedIPs = {allowed_ips}
     def update_awg_settings(self, protocol_type, mtu=None, dns=None, special_junk=None, dns6=None):
         """Rewrite MTU/DNS/I1-I5 in the server config and apply them live.
 
-        I1-I5 go to the kernel through `awg syncconf`, so peers stay up; MTU
-        and DNS only matter when a client config is generated. Existing
+        I1-I5 go to the kernel through `awg syncconf`, so peers stay up. AWG3
+        also applies MTU to the live server interface. Existing
         clients pick the new values up on their next config export -- the
         config they already imported keeps the old ones.
         """
@@ -3078,9 +3140,19 @@ AllowedIPs = {allowed_ips}
         # A None means "leave this alone"; an empty string means "clear it",
         # which drops the line so the built-in default applies again.
         replaced = {}
+        live_mtu = None
         if mtu is not None:
             value = str(mtu).strip()
-            replaced['MTU'] = f"# MTU = {value}" if value else None
+            if self._base_protocol(protocol_type) == self.AWG3:
+                value = value or self._default_mtu(protocol_type)
+                minimum = 1280 if self._get_subnet_ipv6_ip(protocol_type) else 576
+                if not value.isdecimal() or not minimum <= int(value) <= 65535:
+                    raise ValueError(f'MTU must be between {minimum} and 65535')
+                value = str(int(value))
+                live_mtu = value
+                replaced['MTU'] = f"MTU = {value}"
+            else:
+                replaced['MTU'] = f"# MTU = {value}" if value else None
         if dns is not None:
             value = str(dns).strip()
             replaced['DNS'] = f"# DNS = {value}" if value else None
@@ -3109,6 +3181,15 @@ AllowedIPs = {allowed_ips}
         if tail:
             head.append('')  # keep [Interface] and [Peer] visually apart
         self._write_server_config(protocol_type, '\n'.join(head + tail))
+
+        if live_mtu is not None:
+            container = self._container_name(protocol_type)
+            iface = self._interface_name(protocol_type, self._resolve_config_path(protocol_type))
+            out, err, code = self.ssh.run_sudo_command(
+                f'docker exec {container} ip link set dev {iface} mtu {live_mtu}'
+            )
+            if code != 0:
+                raise RuntimeError(f'Failed to apply server MTU: {err or out}')
 
         if junk is not None:
             # There is no way to spell an empty I1-I5 in a config file
@@ -3162,12 +3243,12 @@ AllowedIPs = {allowed_ips}
         """MTU for generated client configs.
 
         Priority: per-client override > `MTU = ...` line in the server config
-        > built-in default. Amnezia's own clients use 1376; the 1280 this
-        panel used to hardcode is itself a usable fingerprint.
+        > protocol default. AWG3 uses 1280 to leave room for header protection,
+        transport padding and trailers without relying on fragmentation.
         """
         if user_data and user_data.get('mtu'):
             return str(user_data['mtu'])
-        return self._read_config_key(protocol_type, 'MTU') or AWG_DEFAULTS['mtu']
+        return self._read_config_key(protocol_type, 'MTU') or self._default_mtu(protocol_type)
 
     def save_client_config(self, protocol_type, client_id, config_text):
         """Persist a manually edited client config. Stored verbatim in
