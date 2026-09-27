@@ -1,0 +1,15 @@
+[Unit]
+Description=Refresh provider IPv6 neighbor discovery from the global address
+Wants=network-online.target
+After=network-online.target
+
+[Service]
+Type=simple
+Environment=NDP_INTERFACE=net0
+Environment=NDP_INTERVAL_SECONDS=3
+ExecStart=/usr/local/sbin/prosto-ipv6-ndp-refresh
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

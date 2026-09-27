@@ -76,6 +76,29 @@ export and re-enabling. An already issued gateway collision requires moving
 the server gateway to an unused address in the same IPv6 prefix; deploying
 the panel alone does not change existing node addresses or keys.
 
+On some VPS networks the external IPv6 gateway answers multicast neighbor
+solicitations but ignores unicast reachability probes. A single successful
+HTTPS request can therefore hide recurring several-second IPv6 outages.
+Capture the host uplink as well as the AWG interface and repeat DNS/HTTPS
+checks over several neighbor reachability cycles. For the affected node,
+inspect the successful neighbor advertisements before choosing a workaround.
+A static gateway neighbor entry or shorter probe timers may still fail if
+the provider needs Neighbor Discovery from the guest's global IPv6 address.
+Keep any host-specific repair separate from fleet-wide panel startup actions
+and verify it over repeated DNS/HTTPS requests before persisting it.
+
+`scripts/refresh_ipv6_gateway.sh` and
+`config/prosto-ipv6-ndp-refresh.service` provide an opt-in workaround that
+sends a multicast neighbor solicitation from the host's global IPv6 address
+every three seconds. They discover the current address and gateway dynamically
+and do not pin the provider MAC, change routes, or restart networking. Install
+`ndisc6`, copy the script to `/usr/local/sbin/prosto-ipv6-ndp-refresh` with mode
+755, and install the unit under `/etc/systemd/system`. Set `NDP_INTERFACE` to
+the affected uplink before enabling it. Test the script with `--once`, then
+run `systemctl daemon-reload` and
+`systemctl enable --now prosto-ipv6-ndp-refresh.service`. Revert by disabling
+the unit. This workaround is not installed automatically by the panel.
+
 ## Verification
 
 Use Docker for all Python checks:
