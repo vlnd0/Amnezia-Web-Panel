@@ -53,3 +53,18 @@ to the bot. An older panel returns 404, handled as an unavailable diagnostic.
 Tests run only in Docker. `tests/test_server_health.py` includes an actual local
 Linux packet-socket/UDP test (default Docker CAP_NET_RAW), along with fake-SSH
 checks for failed senders, unavailable capture, authorization and caching.
+
+`POST /api/health/servers/{server_id}/ips` accepts
+`{"addresses": ["192.0.2.1", "192.0.2.2"]}` to check the bot's current and spare
+pool addresses with the same RU probes. At most eight literal IPv4 addresses
+are accepted per call; duplicates are removed. SSH connects to the configured
+target node while senders use the literal addresses, and capture matches the
+exact destination IP. No DNS change is required to test a spare address.
+Only the target and unambiguous RU source nodes are connected, and a RU target
+skips probing itself. AWG3 targets are supported too.
+
+The response contains `server_id`, `checked_at`, `udp_port: 443`, `probe_sources`
+(the names of the applicable sources), and `addresses`, mapping each IP to the
+same per-source delivery statuses as the fleet diagnostic. Each call runs
+afresh under the shared health lock; cancelled requests retain the lock until
+the worker finishes. The existing fleet health cache remains unchanged.

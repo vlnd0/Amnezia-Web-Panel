@@ -1,4 +1,5 @@
 import os
+import ipaddress
 import sys
 import json
 import logging
@@ -2920,6 +2921,31 @@ def api_login(request: Request, req: LoginRequest):
 _HEALTH_LOCK = asyncio.Lock()
 _HEALTH_CACHE = None
 _HEALTH_CACHE_AT = 0.0
+
+
+class IpHealthRequest(BaseModel):
+    addresses: List[ipaddress.IPv4Address] = Field(min_length=1, max_length=8)
+
+
+@app.post('/api/health/servers/{server_id}/ips', tags=["Servers"])
+async def api_server_ip_health(request: Request, server_id: int, body: IpHealthRequest):
+    """Confirm UDP/443 delivery to each requested pool IP from the RU probes."""
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    from managers.server_health import collect_ip_health, is_awg_server
+    servers = load_data().get('servers', [])
+    if not 0 <= server_id < len(servers) or not is_awg_server(servers[server_id]):
+        return JSONResponse({'error': 'AWG server not found'}, status_code=404)
+    addresses = list(dict.fromkeys(str(ip) for ip in body.addresses))
+    async with _HEALTH_LOCK:
+        worker = asyncio.create_task(asyncio.to_thread(
+            collect_ip_health, servers, get_diagnostic_ssh, server_id, addresses
+        ))
+        try:
+            return await asyncio.shield(worker)
+        except asyncio.CancelledError:
+            await worker
+            raise
 
 
 @app.get('/api/health/servers', tags=["Servers"])

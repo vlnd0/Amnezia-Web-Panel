@@ -5,6 +5,7 @@ checks the host; a short packet socket matches only our random UDP payloads.
 Receipt proves delivery to the destination host, NOT an AWG handshake or tunnel.
 """
 
+import ipaddress
 import json
 import re
 import secrets
@@ -20,6 +21,7 @@ UDP_PORT = 443
 SSH_TIMEOUT = 5
 CAPTURE_SECONDS = 6
 MAX_NODES = 24
+MAX_IPS = 8
 TOTAL_BUDGET_SECONDS = 120
 
 # A SOCK_DGRAM packet socket strips the link header. A socket-local BPF filter
@@ -28,7 +30,9 @@ TOTAL_BUDGET_SECONDS = 120
 RECEIVER = r"""
 import ctypes, json, socket, struct, sys, time
 port, seconds = int(sys.argv[1]), float(sys.argv[2])
-tokens = set(sys.argv[3:])
+tokens = {arg for arg in sys.argv[3:] if not arg.startswith('--destination-ip=')}
+destination_ip = next((arg.split('=', 1)[1] for arg in sys.argv[3:]
+                       if arg.startswith('--destination-ip=')), None)
 s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
 class Filter(ctypes.Structure):
     _fields_ = [("code", ctypes.c_ushort), ("jt", ctypes.c_ubyte),
@@ -69,6 +73,8 @@ while time.monotonic() < end and seen != tokens:
     # Reject fragmented traffic rather than matching an incomplete datagram.
     if struct.unpack("!H", p[6:8])[0] & 0x3fff:
         continue
+    if destination_ip is not None and socket.inet_ntoa(p[16:20]) != destination_ip:
+        continue
     size = struct.unpack("!H", p[ihl+4:ihl+6])[0]
     token = p[ihl+8:ihl+size].decode("ascii", errors="ignore")
     if token in tokens:
@@ -103,7 +109,8 @@ def is_awg_server(server):
     return any(
         info.get("installed")
         for name, info in server.get("protocols", {}).items()
-        if name.split('__', 1)[0] in ("awg", "awg2", "awg3", "awg_legacy") and isinstance(info, dict)
+        if name.split("__", 1)[0] in ("awg", "awg2", "awg3", "awg_legacy")
+        and isinstance(info, dict)
     )
 
 
@@ -169,7 +176,7 @@ def _connect(server, ssh_factory):
         return None, {"status": "failed", "reason": "ssh_auth_or_command_failed"}
 
 
-def probe_udp(target, target_ssh, sources):
+def probe_udp(target, target_ssh, sources, *, target_ip=None):
     """sources: name -> (connected SSHManager or None, per-transport lock).
 
     The receiver's READY marker is read before senders start. A missing probe or
@@ -188,7 +195,10 @@ def probe_udp(target, target_ssh, sources):
             for name in PROBE_NAMES
         }
     tokens = {name: "PVH_" + secrets.token_hex(16) for name in active}
-    command = _python(RECEIVER, UDP_PORT, CAPTURE_SECONDS, *tokens.values())
+    destination = [f"--destination-ip={target_ip}"] if target_ip else []
+    command = _python(
+        RECEIVER, UDP_PORT, CAPTURE_SECONDS, *tokens.values(), *destination
+    )
     if target.get("username") != "root":
         command = "sudo -n -- " + command
     stdout = None
@@ -207,7 +217,12 @@ def probe_udp(target, target_ssh, sources):
                 try:
                     with lock, _ssh_deadline(ssh, SSH_TIMEOUT):
                         out, _, code = ssh.run_command(
-                            _python(SENDER, target["host"], UDP_PORT, tokens[name]),
+                            _python(
+                                SENDER,
+                                target_ip or target["host"],
+                                UDP_PORT,
+                                tokens[name],
+                            ),
                             timeout=SSH_TIMEOUT,
                         )
                     result = json.loads(out) if code == 0 else {}
@@ -239,6 +254,69 @@ def probe_udp(target, target_ssh, sources):
         if stdout is not None:
             stdout.channel.close()
     return results
+
+
+def collect_ip_health(servers, ssh_factory, server_id, addresses):
+    """Reuse the RU probes and target capture for literal pool IPv4 addresses.
+
+    SSH always connects to the configured node, not to each spare IP. Only
+    this node and unambiguous RU sources are connected; self probes are skipped.
+    """
+    if not 0 <= server_id < len(servers) or not is_awg_server(servers[server_id]):
+        raise ValueError("invalid_awg_server")
+    if not 1 <= len(addresses) <= MAX_IPS:
+        raise ValueError("invalid_address_count")
+    addresses = list(dict.fromkeys(str(ipaddress.IPv4Address(ip)) for ip in addresses))
+    started = time.monotonic()
+    target = servers[server_id]
+    names = [name for name in PROBE_NAMES if probe_name(target) != name]
+    source_indices = {}
+    for name in names:
+        matches = [i for i, s in enumerate(servers) if probe_name(s) == name]
+        if len(matches) == 1:
+            source_indices[name] = matches[0]
+    indices = list(dict.fromkeys([server_id, *source_indices.values()]))
+    connections = {}
+    try:
+        with ThreadPoolExecutor(max_workers=3) as pool:
+            checks = list(
+                pool.map(lambda i: _connect(servers[i], ssh_factory), indices)
+            )
+        connections = {index: result[0] for index, result in zip(indices, checks)}
+        sources = {
+            name: (connections.get(source_indices.get(name)), threading.Lock())
+            for name in names
+        }
+        results = {}
+        for ip in addresses:
+            if (
+                time.monotonic() - started
+                > TOTAL_BUDGET_SECONDS - CAPTURE_SECONDS - 2 * SSH_TIMEOUT
+            ):
+                result = {
+                    name: {"status": "unknown", "reason": "budget_exceeded"}
+                    for name in names
+                }
+            else:
+                result = probe_udp(
+                    target, connections[server_id], sources, target_ip=ip
+                )
+            results[ip] = {name: result[name] for name in names}
+        return {
+            "server_id": server_id,
+            "checked_at": datetime.now(timezone.utc).isoformat(),
+            "udp_port": UDP_PORT,
+            "addresses": results,
+            "probe_sources": names,
+            "method": "authenticated_ssh_and_one_way_udp_capture",
+        }
+    finally:
+        for ssh in connections.values():
+            if ssh is not None:
+                try:
+                    ssh.disconnect()
+                except Exception:
+                    pass
 
 
 def collect_health(servers, ssh_factory):
