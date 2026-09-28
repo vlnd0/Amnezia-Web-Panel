@@ -1695,7 +1695,12 @@
 
         MARKETPLACE_APPS.forEach(app => {
             const card = document.getElementById(`proto-${protoDomKey(app.proto)}`);
-            const installed = baseInstalled(app.proto);
+            // Show the base card only when the BASE instance itself is
+            // installed. Family visibility (any awg2__N installed) used to
+            // keep a deleted base card on screen as "not installed / install"
+            // — a phantom instance right after uninstall. Extra instances
+            // render their own dynamic cards (ensureProtocolCard) below.
+            const installed = isAppInstalled((currentProtocolStatus || {})[app.proto]);
             if (card) {
                 card.classList.toggle('installed-app-hidden', !installed);
                 card.classList.toggle('installed-app-visible', installed);
