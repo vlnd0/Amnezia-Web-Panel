@@ -4117,6 +4117,16 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
         if req.protocol in server.get('protocols', {}):
             del server['protocols'][req.protocol]
             save_data(data)
+        # The instance is gone: its peers are gone with it, so connections
+        # pointing at this (server, protocol) would dangle forever — the
+        # modal would list a phantom that errors with 'Client not found'
+        # on every action. Purge them like server/user deletion does.
+        data['user_connections'] = [
+            c for c in data.get('user_connections', [])
+            if not (c.get('server_id') == server_id
+                    and c.get('protocol') == req.protocol)
+        ]
+        save_data(data)
         ssh.disconnect()
         if base == 'exit':
             detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
@@ -5462,7 +5472,19 @@ def api_get_user_connections(request: Request, user_id: str):
     if user['role'] in ('user', 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
+    conns = []
+    for c in data.get('user_connections', []):
+        if c['user_id'] != user_id:
+            continue
+        sid = c.get('server_id', 0)
+        # Skip links to uninstalled instances: the peer is gone with the
+        # container, and every action on such a phantom ends in
+        # 'Client not found'. (Uninstall purges them; this is the belt.)
+        if sid < len(data['servers']):
+            srv = data['servers'][sid]
+            if c.get('protocol') not in (srv.get('protocols') or {}):
+                continue
+        conns.append(c)
     for c in conns:
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):
