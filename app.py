@@ -3450,6 +3450,15 @@ def api_check_server(request: Request, server_id: int):
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
 
         protocols_to_check = list(dict.fromkeys(BASE_PROTOCOLS + list(server.get('protocols', {}).keys())))
+        # One batched round trip for all AWG containers (ps snapshot + configs
+        # + clientsTables) instead of 3-5 SSH commands per instance - this is
+        # what made /check take seconds on high-latency servers.
+        try:
+            awg_protos = [p for p in protocols_to_check if protocol_base(p) in AWG_PROTOCOLS]
+            if awg_protos:
+                AWGManager(ssh).prefetch_awg_state(awg_protos)
+        except Exception as e:
+            logger.warning(f"AWG status prefetch failed, falling back to per-instance checks: {e}")
         # Run checks sequentially. Several managers use the same SSH connection;
         # checking them in parallel through one SSH object can produce false
         # negatives and previously caused dynamic AWG instances to be removed.
@@ -4129,7 +4138,16 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             await asyncio.to_thread(manager.remove_container, req.protocol)
         if req.protocol in server.get('protocols', {}):
             del server['protocols'][req.protocol]
-            save_data(data)
+        # The instance is gone: its peers are gone with it, so connections
+        # pointing at this (server, protocol) would dangle forever — the
+        # modal would list a phantom that errors with 'Client not found'
+        # on every action. Purge them like server/user deletion does.
+        data['user_connections'] = [
+            c for c in data.get('user_connections', [])
+            if not (c.get('server_id') == server_id
+                    and c.get('protocol') == req.protocol)
+        ]
+        save_data(data)
         ssh.disconnect()
         if base == 'exit':
             detached = await exit_link_svc.detach_entries_for_exit(server.get('uid'), 'exit_uninstalled')
@@ -4439,6 +4457,8 @@ def api_container_toggle(request: Request, server_id: int, req: ContainerToggleR
         else:
             ssh.run_sudo_command(f"docker start {container}")
             action = 'started'
+        if hasattr(ssh, 'docker_ps_invalidate'):
+            ssh.docker_ps_invalidate()
         ssh.disconnect()
         return {'status': 'success', 'action': action, 'container': container}
     except Exception as e:
@@ -5489,7 +5509,19 @@ def api_get_user_connections(request: Request, user_id: str):
     if user['role'] in ('user', 'none') and user['id'] != user_id:
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     data = load_data()
-    conns = [c for c in data.get('user_connections', []) if c['user_id'] == user_id]
+    conns = []
+    for c in data.get('user_connections', []):
+        if c['user_id'] != user_id:
+            continue
+        sid = c.get('server_id', 0)
+        # Skip links to uninstalled instances: the peer is gone with the
+        # container, and every action on such a phantom ends in
+        # 'Client not found'. (Uninstall purges them; this is the belt.)
+        if sid < len(data['servers']):
+            srv = data['servers'][sid]
+            if c.get('protocol') not in (srv.get('protocols') or {}):
+                continue
+        conns.append(c)
     for c in conns:
         sid = c.get('server_id', 0)
         if sid < len(data['servers']):

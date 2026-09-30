@@ -15,6 +15,22 @@ def serialized_manager(cls):
         @wraps(method)
         def call(self, *args, **kwargs):
             with vars(self.ssh).get("_exec_lock", nullcontext()):
+                # Status snapshots may be stale when a native client or another
+                # process changes the node. Mutations always read current state.
+                if method.__name__ in {
+                    'add_client', 'edit_client', 'toggle_client', 'remove_client',
+                    'rename_client', 'set_speed_limit', 'update_awg_settings',
+                    'save_client_config', 'save_server_config', 'install_protocol',
+                    'remove_container',
+                }:
+                    if '_awg_batch' in vars(self.ssh):
+                        self.ssh._awg_batch = None
+                    cache = vars(self).get('_server_config_cache')
+                    if cache is not None:
+                        cache.clear()
+                if method.__name__ in {'install_protocol', 'remove_container'}:
+                    if '_docker_ps_cache' in vars(self.ssh):
+                        self.ssh._docker_ps_cache = None
                 return method(self, *args, **kwargs)
 
         return call

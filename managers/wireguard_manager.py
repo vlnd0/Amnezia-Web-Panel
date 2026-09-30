@@ -105,6 +105,11 @@ docker --version
 
     def check_container_running(self):
         """Check if WireGuard container is running."""
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[1]
         out, _, code = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Status}}}}'"
         )
@@ -112,6 +117,11 @@ docker --version
 
     def check_protocol_installed(self):
         """Check if protocol is installed (container exists)."""
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.CONTAINER_NAME)
+            if _st is not None:
+                return _st[0]
         out, _, code = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{self.CONTAINER_NAME}$ --format '{{{{.Names}}}}'"
         )
@@ -1094,7 +1104,13 @@ AllowedIPs = {client_ip}/32
                         if 'ListenPort' in line:
                             info['port'] = line.split('=')[1].strip()
                             break
-                    info['clients_count'] = len(self._get_clients_table())
+                    # Count conf-only peers too (they render as 'External'):
+                    # the table alone understates the real peer count.
+                    clients = self._get_clients_table()
+                    known = {c.get('clientId') for c in clients}
+                    conf_peers = self._parse_peers_from_config()
+                    info['clients_count'] = len(known | set(conf_peers))
+                    info['external_count'] = len(set(conf_peers) - known)
                 except Exception as e:
                     info['error'] = str(e)
 

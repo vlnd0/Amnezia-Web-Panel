@@ -77,6 +77,11 @@ class TelemtManager:
         return bool(out.strip())
 
     def check_protocol_installed(self):
+        _st_fn = getattr(self.ssh, 'docker_container_state', None)
+        if _st_fn:
+            _st = _st_fn(self.container_name)
+            if _st is not None:
+                return _st[0]
         out, _, _ = self.ssh.run_command(f"docker ps -a --filter name=^{self.container_name}$ --format '{{{{.Names}}}}'")
         return out.strip() == self.container_name
 

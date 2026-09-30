@@ -162,6 +162,45 @@ class SSHManager:
         with self._exec_lock, self._conn_lock:
             self._disconnect_locked()
 
+    # ----- docker container state snapshot (batch status checks) -----
+
+    # A full `docker ps -a` round trip answers every "container exists /
+    # running" question at once. Status checks used to fire one SSH command
+    # per protocol per question (~20-30 commands per /check), which is what
+    # made server pages slow on high-latency links. The snapshot is cached
+    # for a few seconds so a burst of checks costs a single command.
+    DOCKER_PS_TTL = 10.0
+
+    def docker_ps_snapshot(self):
+        """Dict {container_name: state} from one `docker ps -a` command."""
+        now = time.time()
+        cached = getattr(self, '_docker_ps_cache', None)
+        if cached and now - cached[0] < self.DOCKER_PS_TTL:
+            return cached[1]
+        out, err, code = self.run_sudo_command(
+            "docker ps -a --format '{{.Names}}\t{{.State}}'", timeout=30)
+        if code != 0:
+            raise RuntimeError(f"Cannot read Docker container state: {err or out or code}")
+        states = {}
+        for line in (out or '').splitlines():
+            parts = line.split('\t')
+            if len(parts) != 2 or not all(parts):
+                raise RuntimeError("Incomplete Docker container state response")
+            states[parts[0]] = parts[1]
+        self._docker_ps_cache = (now, states)
+        return states
+
+    def docker_container_state(self, name):
+        """(exists, running) for one container from the snapshot.
+
+        Failed reads raise: they must not report installed containers absent."""
+        states = self.docker_ps_snapshot()
+        return (name in states, states.get(name) == 'running')
+
+    def docker_ps_invalidate(self):
+        """Drop the snapshot after a mutating docker operation."""
+        self._docker_ps_cache = None
+
     def ensure_connected(self):
         """Connect only if there is no live transport.
 

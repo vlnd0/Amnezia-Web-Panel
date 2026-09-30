@@ -739,6 +739,9 @@ docker --version
     def check_container_running(self, protocol_type):
         """Check if AWG container is running."""
         container_name = self._container_name(protocol_type)
+        state = self._snapshot_state(container_name)
+        if state is not None:
+            return state[1]
         # Use ^name$ for exact match (Docker name filter does substring match)
         out, _, code = self.ssh.run_sudo_command(
             f"docker ps --filter name=^{container_name}$ --format '{{{{.Status}}}}'"
@@ -748,11 +751,89 @@ docker --version
     def check_protocol_installed(self, protocol_type):
         """Check if protocol is installed (container exists)."""
         container_name = self._container_name(protocol_type)
+        state = self._snapshot_state(container_name)
+        if state is not None:
+            return state[0]
         out, _, code = self.ssh.run_sudo_command(
             f"docker ps -a --filter name=^{container_name}$ --format '{{{{.Names}}}}'"
         )
         # Exact match check
         return container_name in out.strip().split('\n')
+
+    def _snapshot_state(self, container_name):
+        """(exists, running) from the shared docker ps snapshot, or None."""
+        fn = getattr(self.ssh, 'docker_container_state', None)
+        return fn(container_name) if fn else None
+
+    # ----- batched status prefetch: one SSH command for every AWG container -----
+
+    def prefetch_awg_state(self, protocol_types):
+        """Populate ssh._awg_batch with configs and clients tables.
+
+        A /check used to spend 3-4 SSH round trips per running AWG instance
+        (config, awg params, clientsTable). On high-latency servers this was
+        the bulk of the wait. Here a single command dumps everything for all
+        running AWG containers; _get_server_config/_get_clients_table then
+        read from the cache. The cache lives only for this request (TTL)."""
+        containers = []
+        for proto in protocol_types:
+            cname = self._container_name(proto)
+            state = self._snapshot_state(cname)
+            if state is None:
+                try:
+                    state = self.ssh.docker_container_state(cname)
+                except Exception:
+                    state = None
+            if state and state[1]:
+                containers.append(cname)
+        if not containers:
+            self.ssh._awg_batch = {'_ts': time.time(), 'containers': {}}
+            return
+        cmd = (
+            'for c in ' + ' '.join(containers) + '; do '
+            'echo "@@CONTAINER@@ $c"; '
+            'docker exec "$c" sh -c \'cat /opt/amnezia/awg/awg0.conf 2>/dev/null; '
+            'echo "@@CLIENTS@@"; cat /opt/amnezia/awg/clientsTable 2>/dev/null\'; '
+            'done'
+        )
+        out, err, code = self.ssh.run_sudo_command(cmd, timeout=60)
+        if code != 0:
+            self.ssh._awg_batch = None
+            raise RuntimeError(f"Cannot prefetch AWG state: {err or code}")
+        batch = {}
+        current = None
+        for line in (out or '').splitlines():
+            if line.startswith('@@CONTAINER@@ '):
+                current = line.split(' ', 1)[1].strip()
+                batch[current] = {'config': [], 'clients': [], 'part': 'config'}
+            elif current and line.strip() == '@@CLIENTS@@':
+                batch[current]['part'] = 'clients'
+            elif current:
+                batch[current][batch[current]['part']].append(line)
+        self.ssh._awg_batch = {
+            '_ts': time.time(),
+            'containers': {
+                name: {'config': '\n'.join(parts['config']),
+                       'clients': '\n'.join(parts['clients'])}
+                for name, parts in batch.items()
+            },
+        }
+
+    def _batch_entry(self, container_name):
+        batch = getattr(self.ssh, '_awg_batch', None)
+        if batch is None or time.time() - batch.get('_ts', 0) > 15:
+            return None
+        entry = batch['containers'].get(container_name)
+        if entry is not None:
+            try:
+                if '[Interface]' not in entry.get('config', ''):
+                    raise ValueError('Incomplete configuration')
+                if not isinstance(json.loads(entry.get('clients', '')), (list, dict)):
+                    raise ValueError('Invalid clients table')
+            except (ValueError, TypeError):
+                batch['containers'].pop(container_name, None)
+                return None
+        return entry
 
     def prepare_host(self, protocol_type):
         """Prepare host for container (mirrors prepare_host.sh)."""
@@ -1115,6 +1196,11 @@ done
         # Step 3: Remove old container if exists
         if self.check_protocol_installed(protocol_type):
             results.append("Removing old container...")
+            # AWG containers keep /opt/amnezia/awg (peers, keys, clientsTable)
+            # INSIDE the container - there is no bind mount, so docker rm is
+            # irreversible data loss. Snapshot it to the host first.
+            if not self._backup_container_state(container_name, results):
+                raise RuntimeError("Peer state backup failed; existing container was preserved")
             self.remove_container(protocol_type)
             results.append("Old container removed")
 
@@ -1138,12 +1224,39 @@ done
         self.ssh.run_sudo_command(f"mkdir -p {dockerfile_folder}")
         self.ssh.upload_file_sudo(dockerfile_content, f"{dockerfile_folder}/Dockerfile")
 
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker build --no-cache --pull -t {container_name} {dockerfile_folder}",
-            timeout=300
+        # Run the build detached and poll for its exit code. On flaky links
+        # the SSH channel dies seconds into the build while the docker daemon
+        # keeps building - a synchronous wait then reports a false failure
+        # for a build that actually succeeded. Detached, the build is immune
+        # to channel/transport drops; each poll is a fresh short channel.
+        build_log = f"/tmp/docker-build-{container_name}.log"
+        code_file = f"{build_log}.code"
+        self.ssh.run_sudo_command(f"rm -f {build_log} {code_file}")
+        self.ssh.run_sudo_command(
+            f"nohup sh -c 'docker build --no-cache --pull -t {container_name} "
+            f"{dockerfile_folder} > {build_log} 2>&1; echo $? > {code_file}' "
+            f">/dev/null 2>&1 &",
+            timeout=30
         )
-        if code != 0:
-            raise RuntimeError(f"Failed to build container: {err}")
+        build_code = None
+        deadline = time.time() + 900
+        while time.time() < deadline:
+            time.sleep(5)
+            out, err, code = self.ssh.run_sudo_command(
+                f"cat {code_file} 2>/dev/null", timeout=30)
+            if code == 0 and (out or '').strip().isdigit():
+                build_code = int(out.strip())
+                break
+        if build_code is None:
+            raise RuntimeError(
+                f"Build did not finish within 900s; "
+                f"full log on the server: {build_log}")
+        if build_code != 0:
+            out, err, _ = self.ssh.run_sudo_command(
+                f"tail -c 6000 {build_log}", timeout=30)
+            detail = (out or '').strip() or (
+                f"no output; full log on the server: {build_log}")
+            raise RuntimeError(f"Failed to build container: {detail}")
         results.append("Docker image built successfully")
 
         # Step 5: Run container
@@ -1157,6 +1270,8 @@ done
         out, err, code = self.ssh.run_sudo_command(run_cmd)
         if code != 0:
             raise RuntimeError(f"Failed to run container: {err}")
+        if hasattr(self.ssh, 'docker_ps_invalidate'):
+            self.ssh.docker_ps_invalidate()
 
         # Connect to DNS network
         self.ssh.run_sudo_command(f"docker network connect amnezia-dns-net {container_name}")
@@ -1903,23 +2018,58 @@ x_exit_sync() {
         """Remove AWG container (mirrors remove_container.sh)."""
         container_name = self._container_name(protocol_type)
         self.ssh.run_sudo_command(f"docker stop {container_name}")
-        self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
+        out, err, code = self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
+        if code != 0:
+            raise RuntimeError(f"Failed to remove {container_name}: {err or out}")
         self.ssh.run_sudo_command(f"docker rmi {container_name}")
+        if hasattr(self.ssh, 'docker_ps_invalidate'):
+            self.ssh.docker_ps_invalidate()
         return True
+
+    def _backup_container_state(self, container_name, results=None):
+        """Snapshot the container's /opt/amnezia/awg to a timestamped host dir.
+
+        AWG containers have no bind mount for their state, so removing the
+        container destroys every peer. Called before any destructive remove;
+        A failed snapshot must block destructive reinstall."""
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        dest = f"/opt/amnezia/backups/{container_name}-{ts}"
+        out, err, code = self.ssh.run_sudo_command(
+            f"mkdir -p /opt/amnezia/backups && "
+            f"chmod 700 /opt/amnezia/backups && "
+            f"docker cp {container_name}:/opt/amnezia/awg {dest}"
+        )
+        if code == 0:
+            msg = f"Peer state backed up to {dest}"
+        else:
+            msg = (f"! Peer state backup of {container_name} FAILED: "
+                   f"{((err or out) or '').strip()[:200]}")
+        logger.info(f"_backup_container_state: {msg}")
+        if results is not None:
+            results.append(msg)
+        return code == 0
 
     # ===================== CLIENT MANAGEMENT =====================
 
     def _get_clients_table(self, protocol_type):
         """Get the clients table from the server."""
         container_name = self._container_name(protocol_type)
-        clients_table_path = self._clients_table_path()
-
-        out, err, code = self.ssh.run_sudo_command(
-            f"docker exec -i {container_name} sh -c 'if test -f {clients_table_path}; then cat {clients_table_path}; else exit 42; fi' "
-        )
-        if code == 42:
-            return []
-        if code != 0 or not out.strip():
+        batch = self._batch_entry(container_name)
+        if batch is not None:
+            out = batch['clients']
+        else:
+            clients_table_path = self._clients_table_path()
+            out, err, code = self.ssh.run_sudo_command(
+                f"docker exec -i {container_name} sh -c 'if test -f {clients_table_path}; then cat {clients_table_path}; else exit 42; fi' "
+            )
+            if code == 42:
+                return []
+            if code != 0:
+                raise RuntimeError(f"Cannot read clients table from {container_name}: {err}")
+        if not out.strip():
+            if batch is not None:
+                self.ssh._awg_batch['containers'].pop(container_name, None)
+                return self._get_clients_table(protocol_type)
             raise RuntimeError(f"Cannot read clients table from {container_name}: {err or 'empty response'}")
 
         try:
@@ -1936,6 +2086,9 @@ x_exit_sync() {
                     })
                 return result
         except json.JSONDecodeError as exc:
+            if batch is not None:
+                self.ssh._awg_batch['containers'].pop(container_name, None)
+                return self._get_clients_table(protocol_type)
             raise RuntimeError(f"Invalid clients table JSON in {container_name}") from exc
         raise RuntimeError(f"Invalid clients table structure in {container_name}")
 
@@ -1953,6 +2106,10 @@ x_exit_sync() {
         self.ssh.run_command("rm -f /tmp/_amnz_clients.json")
         if code != 0:
             raise RuntimeError(f"Cannot save clients table in {container_name}: {err}")
+
+        # Drop prefetched batch snapshot so next read sees fresh data
+        if getattr(self.ssh, '_awg_batch', None) is not None:
+            self.ssh._awg_batch = None
 
         # Preserve legacy containers: ordinary client operations must not
         # install tc tooling or replace qdiscs unless limits were opted into.
@@ -2066,6 +2223,11 @@ done < "$BW"
         if cached and time.time() - cached[0] < self._CACHE_TTL:
             return cached[1]
         container_name = self._container_name(protocol_type)
+        batch = self._batch_entry(container_name)
+        if batch is not None:
+            config = batch['config']
+            self._server_config_cache[protocol_type] = (time.time(), config)
+            return config
         config_path = self._resolve_config_path(protocol_type)
 
         out, err, code = self.ssh.run_sudo_command(
@@ -2082,6 +2244,11 @@ done < "$BW"
         same manager instance within _CACHE_TTL returns the pre-write content
         (a peer removed and re-added in one go would be resurrected)."""
         self._server_config_cache.pop(protocol_type, None)
+        # The /check batch cache holds configs AND clientsTables of every
+        # container on this connection - any peer/config write must drop it,
+        # or a read within the batch TTL would resurrect pre-write state.
+        if getattr(self.ssh, '_awg_batch', None) is not None:
+            self.ssh._awg_batch = None
 
     @staticmethod
     def _sanitize_server_config(config_content):
@@ -3326,7 +3493,14 @@ AllowedIPs = {allowed_ips}
                             info['port'] = line.split('=')[1].strip()
                             break
                     info['awg_params'] = self._get_awg_params_from_config(protocol_type)
-                    info['clients_count'] = len(self._get_clients_table(protocol_type))
+                    # Count ALL peers, not only clientsTable rows: peers that
+                    # exist in awg0.conf but not in the table (shown as
+                    # 'External' in the list) are still real connections.
+                    known = {c.get('clientId')
+                             for c in self._get_clients_table(protocol_type)}
+                    conf_peers = self._parse_peers_from_config(protocol_type)
+                    info['clients_count'] = len(known | set(conf_peers))
+                    info['external_count'] = len(set(conf_peers) - known)
                 except Exception as e:
                     info['error'] = str(e)
 
