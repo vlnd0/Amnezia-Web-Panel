@@ -104,4 +104,3 @@ class UninstallHttpClientTests(unittest.TestCase):
             self.assertEqual(response.status_code, 500)
             self.assertEqual(self.state, before)
             save.assert_not_called()
-
