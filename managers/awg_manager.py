@@ -602,7 +602,7 @@ class AWGManager:
         return reserved
 
     def _default_mtu(self, protocol_type):
-        return AWG3_DEFAULT_MTU if self._base_protocol(protocol_type) == self.AWG3 else AWG_DEFAULTS['mtu']
+        return AWG3_DEFAULT_MTU if self._base_protocol(protocol_type) in (self.AWG2, self.AWG3) else AWG_DEFAULTS['mtu']
 
     def _detect_server_ipv6(self, protocol_type=None):
         """Decide whether the tunnel should be dual-stack.
@@ -2935,7 +2935,7 @@ PersistentKeepalive = 25
 
         ud = client.get('userData', {})
         if ud.get('customConfig'):
-            return ud['customConfig']
+            return self._client_export_config(protocol_type, ud['customConfig'])
         client_priv_key = ud.get('clientPrivateKey', '')
         client_ip = self._client_ip_from_userdata(ud) or ''
         psk = ud.get('psk', '')
@@ -3409,13 +3409,34 @@ AllowedIPs = {allowed_ips}
     def _get_mtu(self, protocol_type, user_data=None):
         """MTU for generated client configs.
 
-        Priority: per-client override > `MTU = ...` line in the server config
-        > protocol default. AWG3 uses 1280 to leave room for header protection,
-        transport padding and trailers without relying on fragmentation.
+        AWG2/AWG3 exports always use 1280, including existing peers with old
+        server or per-client overrides. Legacy protocols retain their settings.
         """
+        if self._base_protocol(protocol_type) in (self.AWG2, self.AWG3):
+            return AWG3_DEFAULT_MTU
         if user_data and user_data.get('mtu'):
             return str(user_data['mtu'])
         return self._read_config_key(protocol_type, 'MTU') or self._default_mtu(protocol_type)
+
+    def _client_export_config(self, protocol_type, config):
+        """Normalize saved custom exports without changing peer identity."""
+        if self._base_protocol(protocol_type) not in (self.AWG2, self.AWG3):
+            return config
+        newline = '\r\n' if '\r\n' in config else '\n'
+        lines = []
+        interface = False
+        for line in config.splitlines(keepends=True):
+            section = re.fullmatch(r'\s*\[([^\]]+)\]\s*', line)
+            if section:
+                interface = section[1].strip() == 'Interface'
+                lines.append(line)
+                if interface:
+                    if not line.endswith(('\n', '\r')):
+                        lines.append(newline)
+                    lines.append(f'MTU = {AWG3_DEFAULT_MTU}{newline}')
+            elif not (interface and re.match(r'\s*MTU\s*=', line)):
+                lines.append(line)
+        return ''.join(lines)
 
     def save_client_config(self, protocol_type, client_id, config_text):
         """Persist a manually edited client config. Stored verbatim in

@@ -62,7 +62,14 @@ separate rollout gate.
 
 ## AWG3 MTU and dual-stack address allocation
 
-New AWG3 installations default to MTU 1280 for both client exports and the
+AWG2 and AWG3 client exports always use MTU 1280, including existing peers
+with old server/per-client settings and saved custom configs. Keys, addresses,
+endpoints and all other custom fields are preserved. Legacy AWG retains its
+configured MTU. Existing server interfaces are not resized by downloading a
+client config.
+
+New AWG2 installations default to client MTU 1280. New AWG3 installations
+default to MTU 1280 for both client exports and the
 server interface. Changing AWG3 MTU in the settings persists it in the server
 config and applies it without restarting the container. Existing imported
 client profiles need a new export to pick up the client MTU. AWG2 and legacy

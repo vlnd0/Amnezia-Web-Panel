@@ -90,16 +90,16 @@ def test_ipv4_only_legacy_allocation_and_mtu_stay_unchanged(proto):
     mgr = manager('[Interface]\nAddress = 10.8.1.1/16\n')
     assert mgr._get_next_ip(proto) == '10.8.0.1'
     assert mgr._get_client_ipv6(proto, '10.8.0.1') == ''
-    assert mgr._get_mtu(proto) == '1376'
+    assert mgr._get_mtu(proto) == ('1280' if proto == 'awg2' else '1376')
 
 
-def test_awg3_mtu_default_and_explicit_overrides():
+def test_awg3_exports_ignore_old_server_and_client_mtu_overrides():
     mgr = manager()
     assert mgr._get_mtu('awg3') == '1280'
     assert mgr._get_mtu('awg3__2') == '1280'
-    assert mgr._get_mtu('awg3', {'mtu': '1300'}) == '1300'
+    assert mgr._get_mtu('awg3', {'mtu': '1300'}) == '1280'
     mgr = manager(HEAD + '# MTU = 1320\n')
-    assert mgr._get_mtu('awg3') == '1320'
+    assert mgr._get_mtu('awg3') == '1280'
 
 
 def test_new_awg3_server_persists_safe_interface_and_client_mtu():
@@ -110,7 +110,31 @@ def test_new_awg3_server_persists_safe_interface_and_client_mtu():
     assert '\n# MTU = 1280\n' in command
     mgr._configure_container('awg2', '3478', generate_awg_params(), ipv6=True)
     assert '\nMTU = ' not in mgr.ssh.commands[-1]
-    assert '\n# MTU = 1376\n' in mgr.ssh.commands[-1]
+    assert '\n# MTU = 1280\n' in mgr.ssh.commands[-1]
+
+
+@pytest.mark.parametrize('proto', ['awg2', 'awg2__2', 'awg3', 'awg3__2'])
+def test_existing_and_custom_exports_get_safe_mtu_without_rotating_keys(proto):
+    custom = '[Interface]\nPrivateKey = EXISTING_KEY\nMTU=1376\n\n[Peer]\nPublicKey=SERVER_KEY\n'
+    clients = [{'clientId': 'OLD', 'userData': {
+        'clientIp': '10.8.0.2', 'clientPrivateKey': 'EXISTING_KEY',
+        'psk': 'PSK', 'mtu': '1376',
+    }}]
+    mgr = manager(HEAD + '# MTU = 1376\n', clients)
+    mgr._get_server_public_key = Mock(return_value='SERVER_KEY')
+    assert mgr._get_mtu(proto, clients[0]['userData']) == '1280'
+    # Instance slots share the export policy; avoid FakeSSH path assumptions.
+    mgr._get_clients_table = Mock(return_value=clients)
+    config = mgr.get_client_config(proto, 'OLD', 'example.invalid', '3478')
+    assert 'MTU = 1280' in config
+    assert 'PrivateKey = EXISTING_KEY' in config
+    assert 'PresharedKey = PSK' in config
+    clients[0]['userData']['customConfig'] = custom
+    exported = mgr.get_client_config(proto, 'OLD', 'example.invalid', '3478')
+    assert exported == custom.replace('MTU=1376\n', '').replace(
+        '[Interface]\n', '[Interface]\nMTU = 1280\n')
+    assert clients[0]['userData']['customConfig'] == custom
+    assert not mgr.ssh.uploads
 
 
 def test_mtu_settings_apply_live_without_restarting_or_changing_peers():

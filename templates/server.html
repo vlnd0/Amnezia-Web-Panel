@@ -2617,7 +2617,7 @@
             awgOpts.style.display = 'block';
             // AWG Legacy predates the special junk packets, only MTU/DNS apply.
             document.getElementById('installAwgJunk').style.display = base === 'awg_legacy' ? 'none' : '';
-            document.getElementById('installAwgMtu').value = base === 'awg3' ? '1280' : '1376';
+            document.getElementById('installAwgMtu').value = ['awg2', 'awg3'].includes(base) ? '1280' : '1376';
             document.getElementById('installAwgDns1').value = '1.1.1.1';
             document.getElementById('installAwgDns2').value = '1.0.0.1';
             document.getElementById('installAwgDns6').value = '2606:4700:4700::1111';
