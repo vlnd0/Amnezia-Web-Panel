@@ -51,6 +51,7 @@ import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
 from pwa import build_manifest
+from captcha_challenges import captcha_challenges
 from connection_service import (
     ConnectionService,
     DEFAULT_SELF_SERVICE_SETTINGS,
@@ -138,7 +139,9 @@ class CachedStaticFiles(StaticFiles):
                 else 'public, max-age=3600, must-revalidate')
         return response
 
-app.mount("/static", CachedStaticFiles(directory=os.path.join(os.path.dirname(__file__), "static")), name="static")
+# Bundled resources live beside __file__, not beside the PyInstaller executable.
+STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
+app.mount("/static", CachedStaticFiles(directory=STATIC_DIR), name="static")
 templates = Jinja2Templates(directory=os.path.join(os.path.dirname(__file__), "templates"))
 
 if getattr(sys, 'frozen', False):
@@ -1978,6 +1981,8 @@ def get_current_user(request: Request):
     data = load_data()
     for u in data.get('users', []):
         if u['id'] == user_id:
+            if not u.get('enabled', True) or u.get('role') == 'none':
+                return None
             return u
     return None
 
@@ -1990,7 +1995,7 @@ def static_version():
     page renders new markup against old rules.
     """
     newest = 0.0
-    for root, _dirs, files in os.walk(os.path.join(application_path, 'static')):
+    for root, _dirs, files in os.walk(STATIC_DIR):
         for name in files:
             try:
                 newest = max(newest, os.path.getmtime(os.path.join(root, name)))
@@ -2034,7 +2039,7 @@ def web_manifest(request: Request):
 @app.get('/sw.js')
 def service_worker():
     """Root-scoped service worker. Must not live under /static/ or scope is confined."""
-    path = os.path.join(application_path, 'static', 'sw.js')
+    path = os.path.join(STATIC_DIR, 'sw.js')
     return FileResponse(
         path,
         media_type='text/javascript',
@@ -2797,9 +2802,25 @@ def login_page(request: Request):
 
 @app.get("/set_lang/{lang}", tags=["System Templates"])
 def set_lang(lang: str, request: Request):
+    if lang not in TRANSLATIONS:
+        return JSONResponse({'error': 'Unsupported language'}, status_code=400)
+    # Referer is untrusted: keep only a same-origin path, never an external URL.
     ref = request.headers.get("referer", "/")
-    response = RedirectResponse(url=ref)
-    response.set_cookie(key="lang", value=lang, max_age=31536000)
+    target = '/'
+    try:
+        parsed = urllib.parse.urlsplit(ref)
+        origin = urllib.parse.urlsplit(str(request.base_url))
+        same_origin = (parsed.scheme, parsed.netloc) == (origin.scheme, origin.netloc)
+        relative = not parsed.scheme and not parsed.netloc
+        if (same_origin or relative) and not any(c in ref for c in (chr(92), chr(13), chr(10))):
+            path = parsed.path or '/'
+            if path.startswith('/') and not path.startswith('//'):
+                target = urllib.parse.urlunsplit(('', '', path, parsed.query, ''))
+    except ValueError:
+        pass
+    response = RedirectResponse(url=target)
+    response.set_cookie(key="lang", value=lang, max_age=31536000,
+                        httponly=True, secure=request.url.scheme == 'https', samesite='lax')
     return response
 
 
@@ -2879,7 +2900,9 @@ def api_captcha(request: Request):
     # 2 is a multiplier for the image resolution size
     generator = CaptchaGenerator(2)
     captcha = generator.gen_captcha_image(difficult_level=2)
-    request.session['captcha_answer'] = captcha.characters
+    request.session.pop('captcha_answer', None)  # Remove legacy disclosed answers.
+    captcha_challenges.discard(request.session.pop('captcha_challenge_id', None))
+    request.session['captcha_challenge_id'] = captcha_challenges.issue(captcha.characters)
     
     img_bytes = io.BytesIO()
     captcha.image.save(img_bytes, format='PNG')
@@ -2892,13 +2915,12 @@ def api_captcha(request: Request):
 def api_login(request: Request, req: LoginRequest):
     data = load_data()
     captcha_settings = data.get('settings', {}).get('captcha', {})
+    request.session.pop('captcha_answer', None)  # Never accept legacy cookie answers.
     if captcha_settings.get('enabled') is True:
-        answer = request.session.get('captcha_answer')
+        challenge_id = request.session.pop('captcha_challenge_id', None)
         lang = request.cookies.get('lang', 'ru')
-        if not answer or not req.captcha or answer.lower() != req.captcha.lower():
-            request.session.pop('captcha_answer', None)
+        if not captcha_challenges.consume(challenge_id, req.captcha):
             return JSONResponse({'error': _t('invalid_captcha', lang)}, status_code=400)
-        request.session.pop('captcha_answer', None)
 
     for u in data.get('users', []):
         # Users without a password (role 'none', record-only) can never log in.
@@ -4210,7 +4232,7 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         return JSONResponse({'error': 'Invalid backup filename'}, status_code=400)
     ssh = None
     tmp_path = None
-    tmp_remote = f'/tmp/{filename}'
+    remote_temp_dir = None
     remote_path = f'{manager.BACKUP_ROOT}/{safe_proto}/{filename}'
     try:
         data = load_data()
@@ -4219,6 +4241,10 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         server = data['servers'][server_id]
         ssh = get_ssh(server)
         ssh.connect()
+        # mktemp creates a mode-0700 directory owned by the SSH/SFTP user.
+        # The root-owned readable copy stays inaccessible to other local users.
+        remote_temp_dir = ssh._make_private_temp_dir()
+        tmp_remote = remote_temp_dir + '/' + filename
         quoted_remote = shlex.quote(remote_path)
         quoted_tmp = shlex.quote(tmp_remote)
         # `sudo <a> && <b>` elevates only `<a>`; the whole chain needs one shell
@@ -4234,9 +4260,6 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
             sftp.get(tmp_remote, tmp_path)
         finally:
             sftp.close()
-            ssh.run_sudo_command(f"rm -f {quoted_tmp}")
-            ssh.disconnect()
-            ssh = None
         return FileResponse(
             tmp_path,
             media_type='application/gzip',
@@ -4253,7 +4276,16 @@ def api_protocol_backup_download(request: Request, server_id: int, req: BackupDo
         return JSONResponse({'error': str(e)}, status_code=500)
     finally:
         if ssh:
-            ssh.disconnect()
+            try:
+                if remote_temp_dir:
+                    _, cleanup_error, cleanup_code = ssh.run_sudo_command(
+                        'rm -rf -- ' + shlex.quote(remote_temp_dir))
+                    if cleanup_code != 0:
+                        logger.warning('Remote backup staging cleanup failed: %s', cleanup_error)
+            except Exception:
+                logger.warning('Remote backup staging cleanup failed', exc_info=True)
+            finally:
+                ssh.disconnect()
 
 
 @app.post('/api/servers/{server_id}/backups/upload', tags=["Protocols"])
@@ -5020,11 +5052,17 @@ def api_get_connection_config(request: Request, server_id: int, req: ConnectionA
         data = load_data()
         if server_id >= len(data['servers']):
             return JSONResponse({'error': 'Server not found'}, status_code=404)
-        # Users can only view their own connections
-        if user['role'] in ('user', 'none'):
+        # Only explicit privileged roles may view unowned connections.
+        if user.get('role') not in ('admin', 'support'):
             owned = any(
                 c for c in data.get('user_connections', [])
-                if c.get('client_id') == req.client_id and c.get('server_id') == server_id and c.get('user_id') == user['id']
+                if c.get('client_id') == req.client_id
+                and c.get('server_id') == server_id
+                and c.get('user_id') == user['id']
+                and c.get('protocol')
+                # Preserve manager aliases such as awg and awg__1.
+                and protocol_base(c['protocol']) == protocol_base(req.protocol)
+                and protocol_instance(c['protocol']) == protocol_instance(req.protocol)
             )
             if not owned:
                 return JSONResponse({'error': 'Forbidden'}, status_code=403)
@@ -5564,6 +5602,10 @@ def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request)
     if not user:
         return JSONResponse({'error': 'User not found'}, status_code=404)
     
+    # Revoke signed cookies without changing the public URL. Missing revisions
+    # on existing records start at zero; legacy boolean cookies are rejected.
+    if not req.enabled or req.password is not None:
+        user['share_auth_revision'] = user.get('share_auth_revision', 0) + 1
     user['share_enabled'] = req.enabled
     if not user.get('share_token'):
         user['share_token'] = secrets.token_urlsafe(16)
@@ -5576,6 +5618,14 @@ def api_user_share_setup(user_id: str, req: ShareSetupRequest, request: Request)
     return {'status': 'success', 'share_token': user.get('share_token')}
 
 
+def _share_session_authorized(user, request):
+    if not user.get('share_password_hash'):
+        return True
+    revision = request.session.get(f"share_auth_{user['share_token']}")
+    # bool is an int subclass: require the exact type to reject old True cookies.
+    return type(revision) is int and revision == user.get('share_auth_revision', 0)
+
+
 @app.get('/share/{token}', response_class=HTMLResponse, tags=["System Templates"])
 def share_page(token: str, request: Request):
     data = load_data()
@@ -5584,8 +5634,7 @@ def share_page(token: str, request: Request):
         lang = request.cookies.get('lang', 'ru')
         return HTMLResponse(f"<h1>{_t('share_not_found', lang)}</h1><p>{_t('share_not_found_desc', lang)}</p>", status_code=404)
     
-    auth_session_key = f'share_auth_{token}'
-    need_password = bool(user.get('share_password_hash')) and not request.session.get(auth_session_key)
+    need_password = not _share_session_authorized(user, request)
     
     return tpl(request, 'user_share.html', 
                share_user=user, 
@@ -5601,7 +5650,7 @@ def api_share_auth(token: str, req: ShareAuthRequest, request: Request):
         return JSONResponse({'error': 'Link expired or disabled'}, status_code=404)
     
     if verify_password(req.password, user.get('share_password_hash', '')):
-        request.session[f'share_auth_{token}'] = True
+        request.session[f'share_auth_{token}'] = user.get('share_auth_revision', 0)
         return {'status': 'success'}
     else:
         lang = request.cookies.get('lang', 'ru')
@@ -5615,9 +5664,8 @@ def api_share_connections(token: str, request: Request):
     if not user or not user.get('share_enabled'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     
-    if user.get('share_password_hash'):
-        if not request.session.get(f'share_auth_{token}'):
-            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    if not _share_session_authorized(user, request):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
             
     conns = [dict(c) for c in data.get('user_connections', []) if c['user_id'] == user['id']]
     for c in conns:
@@ -5637,9 +5685,8 @@ def api_share_config(token: str, connection_id: str, request: Request):
     if not user or not user.get('share_enabled'):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     
-    if user.get('share_password_hash'):
-        if not request.session.get(f'share_auth_{token}'):
-            return JSONResponse({'error': 'Unauthorized'}, status_code=401)
+    if not _share_session_authorized(user, request):
+        return JSONResponse({'error': 'Unauthorized'}, status_code=401)
             
     conn = next((c for c in data.get('user_connections', []) if c['id'] == connection_id and c['user_id'] == user['id']), None)
     if not conn:
@@ -6051,16 +6098,23 @@ async def api_backup_restore(request: Request, file: UploadFile = File(...)):
     if not _check_admin(request):
         return JSONResponse({'error': 'Forbidden'}, status_code=403)
     try:
-        content = await file.read()
+        # Limit the in-memory JSON read; enforce request-body limits at the
+        # reverse proxy too, since multipart parsing happens before this handler.
+        max_backup_bytes = 32 * 1024 * 1024
+        content = await file.read(max_backup_bytes + 1)
+        if len(content) > max_backup_bytes:
+            return JSONResponse({'error': 'Backup exceeds the 32 MiB limit'}, status_code=413)
         if not content:
             return JSONResponse({'error': 'Empty file'}, status_code=400)
         
         try:
             backup_data = json.loads(content)
-        except json.JSONDecodeError:
+        except (json.JSONDecodeError, UnicodeDecodeError):
             return JSONResponse({'error': 'Invalid JSON format'}, status_code=400)
 
         # Basic structure validation
+        if not isinstance(backup_data, dict):
+            return JSONResponse({'error': 'Invalid structure: expected a JSON object'}, status_code=400)
         required_keys = ['servers', 'users']
         missing = [k for k in required_keys if k not in backup_data]
         if missing:

@@ -4,6 +4,7 @@ import uuid
 import re
 import os
 import secrets
+import shlex
 from datetime import datetime
 from .ssh_manager import SSHManager
 
@@ -55,10 +56,12 @@ class TelemtManager:
 
     def _api_request(self, method, path, data=None):
         """Execute a curl request inside the docker container."""
-        cmd = f"docker exec {self.container_name} curl -s -X {method} {self.API_URL}{path}"
-        if data:
-            js_data = json.dumps(data).replace('"', '\\"')
-            cmd += f" -H 'Content-Type: application/json' -d \"{js_data}\""
+        args = ['docker', 'exec', self.container_name, 'curl', '-s', '--globoff',
+                '-X', method]
+        if data is not None:
+            args.extend(['-H', 'Content-Type: application/json', '-d', json.dumps(data)])
+        args.extend(['--', self.API_URL + path])
+        cmd = ' '.join(shlex.quote(arg) for arg in args)
         
         out, err, code = self.ssh.run_sudo_command(cmd)
         if code != 0:

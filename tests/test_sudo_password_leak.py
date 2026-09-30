@@ -8,6 +8,7 @@ of the command. The password now travels through the channel's stdin only.
 """
 
 import logging
+import io
 import threading
 import unittest
 from unittest import mock
@@ -68,8 +69,13 @@ class SudoPasswordLeakTests(unittest.TestCase):
         ssh = make_ssh()
         stdin = FakeStdin()
         channel = FakeChannel()
-        ssh.client.exec_command.return_value = (
-            stdin, FakeStream(channel), FakeStream(channel))
+        def execute(command, **kwargs):
+            stdout = (io.BytesIO(b'/tmp/amnezia-private.ABC123def0\n')
+                      if command.startswith('mktemp -d ') else FakeStream(channel))
+            if isinstance(stdout, io.BytesIO):
+                stdout.channel = channel
+            return stdin, stdout, FakeStream(channel)
+        ssh.client.exec_command.side_effect = execute
 
         records = []
 
@@ -87,8 +93,8 @@ class SudoPasswordLeakTests(unittest.TestCase):
         return ssh, stdin, records
 
     def assert_password_hidden(self, ssh, stdin, records):
-        command = ssh.client.exec_command.call_args[0][0]
-        self.assertNotIn(PASSWORD, command)
+        for call in ssh.client.exec_command.call_args_list:
+            self.assertNotIn(PASSWORD, call[0][0])
         self.assertTrue(all(PASSWORD not in r for r in records))
         self.assertEqual(stdin.written, [PASSWORD + '\n'])
         self.assertTrue(stdin.channel.write_closed)
@@ -105,7 +111,9 @@ class SudoPasswordLeakTests(unittest.TestCase):
             lambda s: s.run_sudo_script('echo hi'))
         self.assert_password_hidden(ssh, stdin, records)
         command = ssh.client.exec_command.call_args[0][0]
-        self.assertTrue(command.startswith("sudo -S -p '' bash /tmp/"))
+        commands = [call[0][0] for call in ssh.client.exec_command.call_args_list]
+        self.assertTrue(any(cmd.startswith("sudo -S -p '' bash /tmp/") for cmd in commands))
+        self.assertTrue(command.startswith('rm -rf -- /tmp/amnezia-private.'))
 
     def test_root_login_needs_no_stdin(self):
         ssh = make_ssh()

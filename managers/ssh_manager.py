@@ -8,6 +8,7 @@ import io
 import time
 import threading
 import logging
+import shlex
 
 logger = logging.getLogger(__name__)
 
@@ -286,19 +287,21 @@ class SSHManager:
         if self._is_root:
             return self.run_script(script, timeout=timeout)
 
-        # Write script to temp file via SFTP (avoids heredoc/pipe conflicts)
-        import hashlib
-        script_hash = hashlib.md5(script.encode()).hexdigest()[:8]
-        tmp_script = f"/tmp/_amnz_script_{script_hash}.sh"
-        self.upload_file(script, tmp_script)
+        # Atomically allocate private staging; never follow a preplanted /tmp file.
+        tmp_dir = self._make_private_temp_dir()
+        try:
+            tmp_script = tmp_dir + '/script.sh'
+            self.upload_file(script, tmp_script)
+            return self.run_sudo_command('bash ' + shlex.quote(tmp_script), timeout=timeout)
+        finally:
+            self.run_command('rm -rf -- ' + shlex.quote(tmp_dir))
 
-        # Run with sudo (password via stdin, never on the command line)
-        if self.password:
-            return self.run_command(
-                f"sudo -S -p '' bash {tmp_script}; rm -f {tmp_script}",
-                timeout=timeout, stdin_input=self.password + '\n')
-
-        return self.run_command(f"sudo bash {tmp_script}; rm -f {tmp_script}", timeout=timeout)
+    def _make_private_temp_dir(self):
+        out, err, code = self.run_command('mktemp -d /tmp/amnezia-private.XXXXXXXXXX')
+        path = out.strip()
+        if code != 0 or not path.startswith('/tmp/amnezia-private.') or '/' in path[5:] or '\n' in path:
+            raise RuntimeError(err or 'Failed to create private remote staging directory')
+        return path
 
     def run_script(self, script, timeout=120):
         """Execute a multi-line script on remote server."""
@@ -333,14 +336,17 @@ class SSHManager:
         # Normalize line endings (Windows CRLF -> Unix LF)
         content = content.replace('\r\n', '\n')
 
-        # Write to temp file via SFTP (no sudo needed for /tmp)
-        import hashlib
-        tmp_name = f"/tmp/_amnz_{hashlib.md5(remote_path.encode()).hexdigest()[:8]}"
-        self.upload_file(content, tmp_name)
-
-        # Move to target with sudo
-        self.run_sudo_command(f"mv {tmp_name} {remote_path}")
-        self.run_sudo_command(f"chmod 644 {remote_path}")
+        tmp_dir = self._make_private_temp_dir()
+        try:
+            tmp_path = tmp_dir + '/content'
+            self.upload_file(content, tmp_path)
+            out, err, code = self.run_sudo_command(
+                'mv -- ' + shlex.quote(tmp_path) + ' ' + shlex.quote(remote_path))
+            if code != 0:
+                raise RuntimeError(err or out or 'Failed to install remote file')
+        finally:
+            self.run_command('rm -rf -- ' + shlex.quote(tmp_dir))
+        self.run_sudo_command('chmod 644 -- ' + shlex.quote(remote_path))
         return True
 
     def download_file(self, remote_path):
