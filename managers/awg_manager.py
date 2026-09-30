@@ -797,6 +797,9 @@ docker --version
             'done'
         )
         out, err, code = self.ssh.run_sudo_command(cmd, timeout=60)
+        if code != 0:
+            self.ssh._awg_batch = None
+            raise RuntimeError(f"Cannot prefetch AWG state: {err or code}")
         batch = {}
         current = None
         for line in (out or '').splitlines():
@@ -1186,7 +1189,8 @@ done
             # AWG containers keep /opt/amnezia/awg (peers, keys, clientsTable)
             # INSIDE the container - there is no bind mount, so docker rm is
             # irreversible data loss. Snapshot it to the host first.
-            self._backup_container_state(container_name, results)
+            if not self._backup_container_state(container_name, results):
+                raise RuntimeError("Peer state backup failed; existing container was preserved")
             self.remove_container(protocol_type)
             results.append("Old container removed")
 
@@ -2004,7 +2008,9 @@ x_exit_sync() {
         """Remove AWG container (mirrors remove_container.sh)."""
         container_name = self._container_name(protocol_type)
         self.ssh.run_sudo_command(f"docker stop {container_name}")
-        self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
+        out, err, code = self.ssh.run_sudo_command(f"docker rm -fv {container_name}")
+        if code != 0:
+            raise RuntimeError(f"Failed to remove {container_name}: {err or out}")
         self.ssh.run_sudo_command(f"docker rmi {container_name}")
         if hasattr(self.ssh, 'docker_ps_invalidate'):
             self.ssh.docker_ps_invalidate()
@@ -2015,12 +2021,12 @@ x_exit_sync() {
 
         AWG containers have no bind mount for their state, so removing the
         container destroys every peer. Called before any destructive remove;
-        failures are reported but never block the install (the admin sees the
-        warning line in the install log)."""
+        A failed snapshot must block destructive reinstall."""
         ts = time.strftime('%Y%m%d-%H%M%S')
         dest = f"/opt/amnezia/backups/{container_name}-{ts}"
         out, err, code = self.ssh.run_sudo_command(
             f"mkdir -p /opt/amnezia/backups && "
+            f"chmod 700 /opt/amnezia/backups && "
             f"docker cp {container_name}:/opt/amnezia/awg {dest}"
         )
         if code == 0:

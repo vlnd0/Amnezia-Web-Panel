@@ -66,7 +66,7 @@ class LegacyPoolTests(unittest.TestCase):
 
 class ClientsTableTests(unittest.TestCase):
     def test_old_table_format_keeps_disabled_peer_reservations_and_keys(self):
-        ssh = Mock()
+        ssh = Mock(_awg_batch=None)
         row = {'clientIp': '10.8.0.1', 'enabled': False, 'clientPrivateKey': 'test-key'}
         ssh.run_sudo_command.return_value = (json.dumps({'peer': row}), '', 0)
         manager = AWGManager(ssh)
@@ -76,7 +76,7 @@ class ClientsTableTests(unittest.TestCase):
     def test_failed_read_aborts_add_before_any_write(self):
         for response in [("", "transport died", -1), ("{bad json", "", 0), ("", "", 0)]:
             with self.subTest(response=response):
-                ssh = Mock()
+                ssh = Mock(_awg_batch=None)
                 ssh.run_sudo_command.return_value = response
                 manager = AWGManager(ssh)
                 manager._resolve_config_path = Mock(
@@ -93,7 +93,7 @@ class ClientsTableTests(unittest.TestCase):
                 )
 
     def test_only_confirmed_missing_file_is_empty(self):
-        ssh = Mock()
+        ssh = Mock(_awg_batch=None)
         ssh.run_sudo_command.return_value = ("", "", 42)
         self.assertEqual(AWGManager(ssh)._get_clients_table("awg2"), [])
 

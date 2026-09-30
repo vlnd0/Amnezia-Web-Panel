@@ -4116,7 +4116,6 @@ async def api_uninstall_protocol(request: Request, server_id: int, req: Protocol
             await asyncio.to_thread(manager.remove_container, req.protocol)
         if req.protocol in server.get('protocols', {}):
             del server['protocols'][req.protocol]
-            save_data(data)
         # The instance is gone: its peers are gone with it, so connections
         # pointing at this (server, protocol) would dangle forever — the
         # modal would list a phantom that errors with 'Client not found'

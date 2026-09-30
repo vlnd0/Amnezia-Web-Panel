@@ -178,24 +178,22 @@ class SSHManager:
             return cached[1]
         out, err, code = self.run_sudo_command(
             "docker ps -a --format '{{.Names}}\t{{.State}}'", timeout=30)
+        if code != 0:
+            raise RuntimeError(f"Cannot read Docker container state: {err or out or code}")
         states = {}
-        if code == 0:
-            for line in (out or '').splitlines():
-                parts = line.split('\t')
-                if len(parts) == 2 and parts[0]:
-                    states[parts[0]] = parts[1]
+        for line in (out or '').splitlines():
+            parts = line.split('\t')
+            if len(parts) != 2 or not all(parts):
+                raise RuntimeError("Incomplete Docker container state response")
+            states[parts[0]] = parts[1]
         self._docker_ps_cache = (now, states)
         return states
 
     def docker_container_state(self, name):
         """(exists, running) for one container from the snapshot.
 
-        Returns None when the snapshot itself failed, so callers fall back
-        to their direct per-container command."""
-        try:
-            states = self.docker_ps_snapshot()
-        except Exception:
-            return None
+        Failed reads raise: they must not report installed containers absent."""
+        states = self.docker_ps_snapshot()
         return (name in states, states.get(name) == 'running')
 
     def docker_ps_invalidate(self):

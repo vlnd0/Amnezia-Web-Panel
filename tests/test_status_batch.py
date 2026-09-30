@@ -124,7 +124,7 @@ class PrefetchAwgStateTest(unittest.TestCase):
         mgr.prefetch_awg_state(['awg2'])
         batch_cmds = [c for c in ssh.commands if c.startswith('for c in ')]
         self.assertEqual(batch_cmds, [])
-        self.assertEqual(mgr._get_clients_table('awg2'), [])
+        self.assertNotIn('clients_count', mgr.get_server_status('awg2'))
 
     def test_corrupt_prefetched_clients_falls_back_to_direct_read(self):
         """A truncated batch read (flaky link) must not show up as 0 peers."""
@@ -166,7 +166,7 @@ class PrefetchAwgStateTest(unittest.TestCase):
         ssh = FakeSSH()
         ssh.ps_output = "amnezia-awg2\texited\n"
         mgr = AWGManager(ssh)
-        self.assertEqual(mgr._get_clients_table('awg2'), [])
+        self.assertFalse(mgr.get_server_status('awg2')['container_running'])
         exec_cmds = [c for c in ssh.commands
                      if 'docker exec' in c and not c.startswith('for c in ')]
         self.assertEqual(exec_cmds, [])
@@ -194,7 +194,7 @@ class PrefetchAwgStateTest(unittest.TestCase):
         orig = ssh.run_sudo_command
         def no_file(cmd, timeout=60):
             if 'cat /opt/amnezia/awg/clientsTable' in cmd:
-                return '', '', 1
+                return '', '', 42
             if 'test -f' in cmd:
                 return '', '', 1
             return orig(cmd, timeout)
