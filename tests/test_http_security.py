@@ -43,4 +43,3 @@ class HttpSecurityTests(unittest.TestCase):
                                         json={'protocol': 'awg3', 'client_id': 'synthetic-peer'})
             self.assertEqual(response.status_code, 403)
             ssh.assert_not_called()
-
