@@ -823,7 +823,17 @@ docker --version
         batch = getattr(self.ssh, '_awg_batch', None)
         if batch is None or time.time() - batch.get('_ts', 0) > 15:
             return None
-        return batch['containers'].get(container_name)
+        entry = batch['containers'].get(container_name)
+        if entry is not None:
+            try:
+                if '[Interface]' not in entry.get('config', ''):
+                    raise ValueError('Incomplete configuration')
+                if not isinstance(json.loads(entry.get('clients', '')), (list, dict)):
+                    raise ValueError('Invalid clients table')
+            except (ValueError, TypeError):
+                batch['containers'].pop(container_name, None)
+                return None
+        return entry
 
     def prepare_host(self, protocol_type):
         """Prepare host for container (mirrors prepare_host.sh)."""

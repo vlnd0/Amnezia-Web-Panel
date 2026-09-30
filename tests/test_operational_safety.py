@@ -14,6 +14,29 @@ from managers.ssh_manager import SSHManager
 
 
 class OperationalSafetyTests(unittest.TestCase):
+    def test_mutation_does_not_trust_a_previous_status_snapshot(self):
+        import time
+        ssh = Mock(_awg_batch={'_ts': time.time(), 'containers': {
+            'amnezia-awg2': {'config': '[Interface]\n', 'clients': '[]'},
+        }})
+        ssh.run_sudo_command.return_value = ('', 'transport lost', -1)
+        manager = AWGManager(ssh)
+        with self.assertRaisesRegex(RuntimeError, 'Cannot read clients table'):
+            manager.rename_client('awg2', 'native-peer', 'renamed')
+        self.assertIsNone(ssh._awg_batch)
+        ssh.upload_file.assert_not_called()
+
+    def test_incomplete_batch_config_falls_back_to_direct_read(self):
+        import time
+        ssh = Mock(_awg_batch={'_ts': time.time(), 'containers': {
+            'amnezia-awg2': {'config': '', 'clients': '[]'},
+        }})
+        ssh.run_sudo_command.return_value = ('[Interface]\nListenPort = 443\n', '', 0)
+        manager = AWGManager(ssh)
+        manager._resolve_config_path = Mock(return_value='/opt/amnezia/awg/awg0.conf')
+        self.assertIn('ListenPort = 443', manager._get_server_config('awg2'))
+        ssh.run_sudo_command.assert_called_once()
+
     def test_failed_docker_snapshot_never_caches_absent_containers(self):
         ssh = SSHManager('example.invalid', 22, 'root')
         with patch.object(ssh, 'run_sudo_command', return_value=('', 'transport lost', -1)):
