@@ -17,6 +17,7 @@ import ipaddress
 import logging
 import re
 import time
+import shlex
 from base64 import b64encode, b64decode
 from cryptography.hazmat.primitives.asymmetric.x25519 import X25519PrivateKey
 from cryptography.hazmat.primitives import serialization
@@ -382,6 +383,136 @@ class AWGManager:
         self._config_path_cache = {}   # protocol_type -> (ts, path)
         self._server_config_cache = {} # protocol_type -> (ts, content)
         self._CACHE_TTL = 10
+
+    _RECOVERY_MUTATIONS = {
+        'install_protocol', 'restore_recovery_state', 'add_client', 'edit_client',
+        'toggle_client', 'remove_client', 'rename_client', 'set_speed_limit',
+        'save_client_config', 'save_server_config', 'update_awg_settings',
+        'reconfigure_ports', 'exit_link', 'exit_unlink', 'exit_set_dns_via_exit',
+        'heal_tunnel_onlink',
+    }
+
+    def _recovery_before_operation(self, name, args, kwargs):
+        binding = vars(self.ssh).get('_awg_recovery_binding')
+        if binding and name in self._RECOVERY_MUTATIONS - {'install_protocol', 'restore_recovery_state'}:
+            protocol = kwargs.get('protocol_type') or (args[0] if args else None)
+            store, uid = binding
+            store.mark_pending(uid, protocol)
+
+    def _recovery_after_operation(self, name, args, kwargs, result):
+        binding = vars(self.ssh).get('_awg_recovery_binding')
+        if not binding or name not in self._RECOVERY_MUTATIONS:
+            return
+        if isinstance(result, dict) and (result.get('error') or result.get('status') == 'error'):
+            return
+        protocol = kwargs.get('protocol_type') or (args[0] if args else None)
+        if name == 'restore_recovery_state':
+            protocol = (kwargs.get('state') or args[0])['protocol']
+        store, uid = binding
+        from awg_recovery import AwgRecoveryError
+        try:
+            store.save(uid, self.export_recovery_state(protocol))
+        except Exception as exc:
+            raise AwgRecoveryError(
+                'Node was updated, but panel recovery state could not be saved; retry synchronization'
+            ) from exc
+
+    def export_recovery_state(self, protocol_type):
+        """Read a complete identity and peer state; never include it in an API reply."""
+        from awg_recovery import ALLOWED_FILES, AwgRecoveryError, validate_state
+        self._invalidate_config_cache(protocol_type)
+        container = self._container_name(protocol_type)
+        config_path = self._resolve_config_path(protocol_type)
+        paths = ' '.join(shlex.quote(p) for p in sorted(ALLOWED_FILES))
+        script = (f'for p in {paths}; do if [ -f "$p" ]; then '
+                  'printf "%s:" "$p"; base64 "$p" | tr -d "\\n"; printf "\\n"; fi; done')
+        out, _, code = self.ssh.run_sudo_command(
+            f'docker exec {container} sh -c {shlex.quote(script)}')
+        if code != 0:
+            raise AwgRecoveryError('Cannot read AWG recovery files from node')
+        try:
+            files = {path: b64decode(data, validate=True).decode('utf-8')
+                     for path, data in (line.split(':', 1) for line in out.splitlines())}
+        except (ValueError, UnicodeError) as exc:
+            raise AwgRecoveryError('Incomplete AWG recovery file transfer') from exc
+        # A newly installed container can have no clientsTable yet.
+        if '/opt/amnezia/awg/clientsTable' not in files and '[Peer]' in files.get(config_path, ''):
+            raise AwgRecoveryError('AWG clients table is missing; previous recovery state retained')
+        files.setdefault('/opt/amnezia/awg/clientsTable', '[]')
+        bindings, _, code = self.ssh.run_sudo_command(
+            f"docker inspect --format '{{{{json .HostConfig.PortBindings}}}}' {container}")
+        if code != 0:
+            raise AwgRecoveryError('Cannot read published AWG ports from node')
+        from awg_recovery import config_values
+        try:
+            port = int(config_values(files[config_path])['ListenPort'][0])
+            state = {
+                'version': 1, 'protocol': protocol_type, 'files': files,
+                'config_path': config_path, 'listen_port': port,
+                'server_public_key': files['/opt/amnezia/awg/wireguard_server_public_key.key'].strip(),
+                'port_bindings': {p: hosts for p, hosts in json.loads(bindings).items()
+                                  if p.endswith('/udp')},
+            }
+        except (ValueError, KeyError, TypeError, AttributeError) as exc:
+            raise AwgRecoveryError('Incomplete AWG identity or ports on node') from exc
+        return validate_state(state, protocol_type)
+
+    def capture_recovery_state(self, protocol_type):
+        """Snapshot and commit under the same SSH lock as every peer mutation."""
+        from awg_recovery import AwgRecoveryError
+        binding = vars(self.ssh).get('_awg_recovery_binding')
+        if not binding:
+            raise AwgRecoveryError('Panel recovery storage is not configured for this node')
+        store, uid = binding
+        return store.save(uid, self.export_recovery_state(protocol_type))
+
+    def _restore_recovery_files(self, state):
+        """Stage secrets through private SFTP files, never SSH command arguments."""
+        container = self._container_name(state['protocol'])
+        staging = self.ssh._make_private_temp_dir()
+        script_path = staging + '/restore.sh'
+        lines = ['set -eu', 'umask 077', 'work=$(mktemp -d /tmp/amnezia-recovery.XXXXXXXXXX)',
+                 'trap \'rm -rf -- "$work"\' EXIT']
+        for path, content in state['files'].items():
+            relative = path.removeprefix('/opt/amnezia/')
+            encoded = b64encode(content.encode()).decode()
+            lines.append(f'mkdir -p "$work/{os.path.dirname(relative)}"')
+            lines.append(f"printf '%s' '{encoded}' | base64 -d > \"$work/{relative}\"")
+        lines.extend(['chmod 700 "$work/start.sh"',
+                      f'docker cp "$work/." {container}:/opt/amnezia/'])
+        try:
+            self.ssh.upload_file('\n'.join(lines), script_path)
+            _, _, code = self.ssh.run_sudo_command('bash ' + shlex.quote(script_path), timeout=120)
+            if code != 0:
+                from awg_recovery import AwgRecoveryError
+                raise AwgRecoveryError('Failed to restore AWG identity files')
+        finally:
+            self.ssh.run_command('rm -rf -- ' + shlex.quote(staging))
+        self._config_path_cache.pop(state['protocol'], None)
+        self._invalidate_config_cache(state['protocol'])
+
+    def _verify_recovery_identity(self, state):
+        from awg_recovery import AwgRecoveryError, config_values
+        protocol = state['protocol']
+        container = self._container_name(protocol)
+        tool = self._wg_binary(protocol)
+        iface = self._interface_name(protocol, state['config_path'])
+        key, _, code = self.ssh.run_sudo_command(f'docker exec {container} {tool} show {iface} public-key')
+        if code != 0 or key.strip() != state['server_public_key']:
+            raise AwgRecoveryError('Restored AWG runtime has a different server identity')
+        peers, _, code = self.ssh.run_sudo_command(f'docker exec {container} {tool} show {iface} peers')
+        expected = set(config_values(state['files'][state['config_path']], 'Peer').get('PublicKey', []))
+        if code != 0 or set(peers.split()) != expected:
+            raise AwgRecoveryError('Restored AWG runtime has different peers')
+
+    def restore_recovery_state(self, state):
+        from awg_recovery import AwgRecoveryError, validate_state
+        validate_state(state)
+        protocol = state['protocol']
+        if self.check_protocol_installed(protocol):
+            raise AwgRecoveryError('AWG container already exists; recovery requires a missing container')
+        return self.install_protocol(protocol, port=state['listen_port'], recovery_state=state,
+                                     require_missing=True)
 
     def _base_protocol(self, protocol_type):
         """Return base protocol for instance keys like awg__2."""
@@ -1095,7 +1226,8 @@ done
         return info
 
     def install_protocol(self, protocol_type, port=None, awg_params=None,
-                         mtu=None, dns=None, special_junk=None, dns6=None):
+                         mtu=None, dns=None, special_junk=None, dns6=None,
+                         recovery_state=None, require_missing=False):
         """
         Full installation of AWG or AWG-Legacy protocol.
         Steps: install docker -> prepare host -> build container ->
@@ -1104,6 +1236,20 @@ done
         mtu/dns end up in the generated client configs; special_junk is an
         {'i1': ..., 'i5': ...} mapping overriding the generated I1-I5.
         """
+        binding = vars(self.ssh).get('_awg_recovery_binding')
+        if recovery_state is None and binding:
+            store, uid = binding
+            if self.check_protocol_installed(protocol_type):
+                store.save(uid, self.export_recovery_state(protocol_type))
+            recovery_state = store.load(uid, protocol_type)
+        if recovery_state is not None:
+            from awg_recovery import AwgRecoveryError, validate_state
+            validate_state(recovery_state, protocol_type)
+            if port is not None and int(port) != recovery_state['listen_port']:
+                raise AwgRecoveryError('Recovery preserves the existing listen port; change ports separately')
+            port = recovery_state['listen_port']
+        if binding and recovery_state is None:
+            binding[0].mark_pending(binding[1], protocol_type)
         if port is None:
             port = AWG_DEFAULTS['port']
 
@@ -1195,6 +1341,9 @@ done
 
         # Step 3: Remove old container if exists
         if self.check_protocol_installed(protocol_type):
+            if require_missing:
+                from awg_recovery import AwgRecoveryError
+                raise AwgRecoveryError('AWG container appeared during recovery; existing container was preserved')
             results.append("Removing old container...")
             # AWG containers keep /opt/amnezia/awg (peers, keys, clientsTable)
             # INSIDE the container - there is no bind mount, so docker rm is
@@ -1266,6 +1415,20 @@ done
         # _docker_run_cmd.
         ipv6_enabled = self._detect_server_ipv6()
         run_cmd = self._docker_run_cmd(container_name, container_name, port, ipv6_enabled)
+        if recovery_state is not None:
+            from awg_recovery import config_values
+            saved_addresses = config_values(recovery_state['files'][recovery_state['config_path']])['Address']
+            ipv6_enabled = any(':' in value for value in saved_addresses)
+            run_cmd = self._docker_run_cmd(container_name, container_name, port, ipv6_enabled)
+            mappings = []
+            for target, hosts in recovery_state['port_bindings'].items():
+                for host in hosts:
+                    host_ip = host.get('HostIp', '')
+                    if ':' in host_ip:
+                        host_ip = f'[{host_ip}]'
+                    prefix = host_ip + ':' if host_ip else ''
+                    mappings.append(f"-p {prefix}{int(host['HostPort'])}:{target}")
+            run_cmd = run_cmd.replace(f'-p {port}:{port}/udp', ' '.join(mappings))
 
         out, err, code = self.ssh.run_sudo_command(run_cmd)
         if code != 0:
@@ -1289,14 +1452,25 @@ done
             if ipv6_enabled else
             "No usable IPv6 (host or Docker), tunnel will be IPv4-only"
         )
-        self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled,
-                                  mtu=mtu, dns=dns, dns6=dns6)
+        if recovery_state is not None:
+            self._restore_recovery_files(recovery_state)
+        else:
+            self._configure_container(protocol_type, port, awg_params, ipv6=ipv6_enabled,
+                                      mtu=mtu, dns=dns, dns6=dns6)
         results.append("AWG configured")
 
         # Step 7: Upload and run start script
         results.append("Starting AWG service...")
-        self._upload_start_script(protocol_type)
+        if recovery_state is not None:
+            self.ssh.run_sudo_command(f'docker restart {container_name}')
+            self._wait_container_running(container_name)
+        else:
+            self._upload_start_script(protocol_type)
         self._verify_interface_up(protocol_type)
+        if recovery_state is not None:
+            self._verify_recovery_identity(recovery_state)
+            awg_params = self._get_awg_params_from_config(protocol_type)
+            results.append('Restored existing server identity, peer state and published ports')
         results.append("AWG service started")
 
         # Step 8: Setup firewall

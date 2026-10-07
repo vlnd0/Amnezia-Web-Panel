@@ -606,5 +606,16 @@
   "stop_peer_title": "Stop",
   "start_peer_title": "Enable",
   "ssh_cooldown_title": "SSH cooldown (sec)",
-  "ssh_cooldown_hint": "Initial delay before reconnecting to an unreachable server. Do not change if the server works fine."
+  "ssh_cooldown_hint": "Initial delay before reconnecting to an unreachable server. Do not change if the server works fine.",
+  "awg_recovery": "Node recovery",
+  "awg_recovery_ready": "Saved in panel",
+  "awg_recovery_missing": "Not saved yet",
+  "awg_recovery_sync": "Save recovery state",
+  "awg_recovery_restore": "Restore issued keys",
+  "awg_recovery_saving": "Saving…",
+  "awg_recovery_saved": "Recovery state saved in panel",
+  "awg_recovery_restoring": "Restoring node…",
+  "awg_recovery_restored": "Node restored with existing keys",
+  "awg_recovery_confirm": "Restore this AWG instance with its saved server identity and clients? Keep the same public hostname or IP so issued configs continue to work.",
+  "awg_recovery_pending": "Needs synchronization"
 }

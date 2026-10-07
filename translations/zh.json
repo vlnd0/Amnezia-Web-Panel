@@ -573,5 +573,16 @@
   "stop_peer_title": "停止",
   "start_peer_title": "启用",
   "ssh_cooldown_title": "SSH 冷却时间(秒)",
-  "ssh_cooldown_hint": "重新连接不可达服务器前的初始延迟。如果服务器工作正常,请勿更改。"
+  "ssh_cooldown_hint": "重新连接不可达服务器前的初始延迟。如果服务器工作正常,请勿更改。",
+  "awg_recovery": "Node recovery",
+  "awg_recovery_ready": "Saved in panel",
+  "awg_recovery_missing": "Not saved yet",
+  "awg_recovery_sync": "Save recovery state",
+  "awg_recovery_restore": "Restore issued keys",
+  "awg_recovery_saving": "Saving…",
+  "awg_recovery_saved": "Recovery state saved in panel",
+  "awg_recovery_restoring": "Restoring node…",
+  "awg_recovery_restored": "Node restored with existing keys",
+  "awg_recovery_confirm": "Restore this AWG instance with its saved server identity and clients? Keep the same public hostname or IP so issued configs continue to work.",
+  "awg_recovery_pending": "Needs synchronization"
 }

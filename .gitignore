@@ -30,6 +30,7 @@ coverage.xml
 
 # User data
 data.json
+awg-recovery/
 .DS_Store
 
 # IDEs

@@ -102,7 +102,8 @@ Configuration panel for system parameters and preferences:
     *   One-click check for fresh GitHub releases to stay up to date.
 *   **📤 Data Interoperability**:
     *   **Remnawave Sync**: Automatically import and sync users from Remnawave.
-    *   **Simple Backup**: Effortless JSON-based export and restore of all panel data.
+    *   **AWG node recovery**: The panel automatically stores server identity, PSK, obfuscation, peer configuration (including disabled clients), published UDP ports and startup/exit-link files on its own persistent disk. Recreate a lost node with its existing issued configs, without a manually prepared node backup.
+    *   **Simple Backup**: JSON-based export and restore of panel inventory and accounts.
     *   **Backup / Migrate protocols (Alpha)**: Move protocol configurations between nodes for maintenance, recovery, and migration workflows.
 *   **🔗 Public Sharing**:
     *   Generate password-protected links for users to download their configurations without panel access.
@@ -127,6 +128,32 @@ If you require any custom features not currently available in the panel, **let u
 * **Database Support**: PostgreSQL, MySQL/MariaDB, SQLite, Oracle, and MS SQL Server
 * **In-Panel File Editor**: Edit configuration files inside containers directly from the web interface
 * **Advanced backup automation**: Scheduled backups, external storage, and richer recovery workflows
+
+### Recovering a lost AWG node
+
+AWG, AWG2, AWG3 and AWG Legacy instances save their recovery state after panel operations.
+Existing reachable nodes are enrolled automatically at startup and synchronized every five minutes;
+the card's **Save recovery state** action synchronizes immediately. Native edits made outside the panel
+are protected once synchronization succeeds. The card shows the last successful capture time.
+
+After reinstalling the server, keep its existing panel record (its UID ties it to recovery state)
+and update SSH credentials through **Edit server**. Keep the same public hostname or IP;
+if the IP changes, point the existing hostname to the replacement server. Once the AWG container
+is absent, **Restore issued keys** rebuilds it with the saved server key, original addresses,
+obfuscation, PSKs, peer enablement and port mappings. It refuses to overwrite an existing container
+or use state with an unfinished synchronization. Normal AWG reinstalls also preserve the saved identity.
+If a native reinstall generates a different server key, automatic synchronization retains the original
+identity instead of overwriting it with the new one.
+
+State is stored in `awg-recovery/state.sqlite3` beside the **resolved** `DATA_FILE`, so a `data.json`
+symlink into a Railway volume keeps the recovery database on that volume. The directory is mode `0700`
+and the database is mode `0600`. Secret state is excluded from status responses and HTML pages.
+The panel's persistent volume must survive: this recovers a lost VPN node, not a lost panel disk.
+JSON inventory exports do not include the recovery database. `AWG_RECOVERY_SYNC=off` disables periodic
+enrollment only; synchronous capture after panel mutations remains enabled.
+
+Already lost server private keys cannot be reconstructed. Every running node needs at least one
+successful capture before recovery is available.
 * **Advanced protocol migration**: Extended migration tooling for complex multi-node setups
 * **Xray Self-Steal Mode**: Advanced Xray configuration with self-steal functionality
 * **And much more!**

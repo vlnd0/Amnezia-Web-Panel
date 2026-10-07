@@ -1,4 +1,5 @@
 data.json
+**/awg-recovery
 .git
 .pytest_cache
 __pycache__

@@ -2197,6 +2197,19 @@
                 ctrlEl.innerHTML = '';
             }
         }
+        if (['awg', 'awg2', 'awg3', 'awg_legacy'].includes(protoBase(proto))) {
+            const recovery = info.recovery || {};
+            const label = recovery.available ? _('awg_recovery_ready') : (recovery.sync_pending ? _('awg_recovery_pending') : _('awg_recovery_missing'));
+            const details = recovery.available ? `${label} · ${formatBackupTime(Date.parse(recovery.captured_at) / 1000)}` : label;
+            if (infoGrid) {
+                infoGrid.innerHTML += `<div class="protocol-info-item"><span class="protocol-info-label">${_('awg_recovery')}</span><span class="protocol-info-value">${escapeHtml(details)}</span></div>`;
+            }
+            if (info.container_running) {
+                actionsEl.innerHTML += `<button class="btn btn-secondary btn-sm" onclick="captureAwgRecovery('${proto}', this)">${_('awg_recovery_sync')}</button>`;
+            } else if (recovery.available && (info.container_missing || !info.container_exists)) {
+                actionsEl.innerHTML = `<button class="btn btn-primary btn-sm" onclick="restoreAwgRecovery('${proto}', this)">${_('awg_recovery_restore')}</button>`;
+            }
+        }
         // Small pencil next to the instance name (visible on name hover).
         // data-proto is (re)assigned here because cloned multi-instance cards
         // inherit the base card's stale value.
@@ -2750,6 +2763,37 @@
 
     function backupDownloadUrl(proto, filename) {
         return `/api/servers/${SERVER_ID}/backups/download`;
+    }
+
+    async function captureAwgRecovery(proto, button) {
+        button.disabled = true;
+        button.textContent = _('awg_recovery_saving');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/recovery/capture`, 'POST', {protocol: proto});
+            showToast(_('awg_recovery_saved'), 'success');
+            await checkServer();
+        } catch (error) {
+            showToast(error.message, 'error');
+        } finally {
+            button.disabled = false;
+            button.textContent = _('awg_recovery_sync');
+        }
+    }
+
+    async function restoreAwgRecovery(proto, button) {
+        if (!confirm(_('awg_recovery_confirm'))) return;
+        button.disabled = true;
+        button.textContent = _('awg_recovery_restoring');
+        try {
+            await apiCall(`/api/servers/${SERVER_ID}/recovery/restore`, 'POST', {protocol: proto});
+            showToast(_('awg_recovery_restored'), 'success');
+            await checkServer();
+        } catch (error) {
+            showToast(error.message, 'error');
+        } finally {
+            button.disabled = false;
+            button.textContent = _('awg_recovery_restore');
+        }
     }
 
     async function showProtocolBackups(proto) {

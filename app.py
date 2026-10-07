@@ -47,6 +47,7 @@ from managers.awg_manager import AWGManager, normalize_special_junk
 from managers.xray_manager import XrayManager
 from managers.wireguard_manager import WireGuardManager
 from managers.backup_manager import BackupManager
+from awg_recovery import AwgRecoveryError, AwgRecoveryStore, PROTOCOL_RE, state_summary
 import telegram_bot as tg_bot
 
 from exit_link_service import ExitLinkError, ExitLinkService
@@ -152,6 +153,18 @@ else:
 DATA_FILE = os.path.abspath(os.path.expanduser(
     os.environ.get('DATA_FILE') or os.path.join(application_path, 'data.json')
 ))
+
+
+def awg_recovery_store():
+    # DATA_FILE can be a symlink into Railway's persistent /app/data volume.
+    directory = os.path.join(os.path.dirname(os.path.realpath(DATA_FILE)), 'awg-recovery')
+    return AwgRecoveryStore(os.path.join(directory, 'state.sqlite3'))
+
+
+@app.exception_handler(AwgRecoveryError)
+async def awg_recovery_error_handler(request, exc):
+    return JSONResponse({'error': str(exc)}, status_code=503)
+
 CURRENT_VERSION = "v1.6.7"
 
 # Custom protocol instance names: the rename modal caps input at 64 chars.
@@ -312,6 +325,8 @@ def get_ssh(server):
         # Apply edits without dropping the pooled connection.
         ssh._connect_cooldown_base = cooldown_base
         ssh.pooled = True
+        if server.get('uid'):
+            ssh._awg_recovery_binding = (awg_recovery_store(), server['uid'])
     ssh.ensure_connected()
     return ssh
 
@@ -2540,6 +2555,8 @@ async def startup():
 
     # Start periodic background tasks
     asyncio.create_task(periodic_background_tasks())
+    if os.environ.get('AWG_RECOVERY_SYNC', 'on').lower() in ('1', 'true', 'on'):
+        asyncio.create_task(periodic_awg_recovery())
 
     # Start Telegram bot if enabled
     tg_cfg = data.get('settings', {}).get('telegram', {})
@@ -2564,6 +2581,39 @@ def _auto_backup_due(auto_backup: dict, now: Optional[datetime] = None) -> bool:
         return True
     now = now or datetime.now()
     return now - last_run >= timedelta(hours=interval_hours)
+
+
+def synchronize_awg_recovery():
+    """Enroll existing live nodes; unreachable nodes retain their last good state."""
+    data = load_data()
+    for server in data.get('servers', []):
+        if not server.get('uid'):
+            continue
+        protocols = [p for p, info in server.get('protocols', {}).items()
+                     if PROTOCOL_RE.fullmatch(p) and info.get('installed')]
+        if not protocols:
+            continue
+        try:
+            ssh = get_ssh(server)
+            manager = AWGManager(ssh)
+            for protocol in protocols:
+                try:
+                    if manager.check_protocol_installed(protocol):
+                        manager.capture_recovery_state(protocol)
+                except Exception:
+                    logger.warning('AWG recovery synchronization failed for %s/%s',
+                                   server['uid'], protocol)
+        except Exception:
+            logger.warning('AWG recovery node is unavailable: %s', server['uid'])
+
+
+async def periodic_awg_recovery():
+    while True:
+        try:
+            await asyncio.to_thread(synchronize_awg_recovery)
+        except Exception:
+            logger.warning('AWG recovery synchronization failed')
+        await asyncio.sleep(300)
 
 
 def _create_auto_backups_once(data: dict) -> dict:
@@ -3413,6 +3463,8 @@ def api_check_server(request: Request, server_id: int):
                         merged.setdefault(key, db_proto[key])
             if protocol_base(proto) in AWG_PROTOCOLS and db_proto.get('exit_link'):
                 merged['exit_link'] = db_proto['exit_link']
+            if protocol_base(proto) in AWG_PROTOCOLS:
+                merged['recovery'] = state_summary(awg_recovery_store().load(server.get('uid'), proto, allow_pending=True))
             return merged
 
         def should_preserve_saved_protocol(proto, result=None, err=None):
@@ -3423,6 +3475,8 @@ def api_check_server(request: Request, server_id: int):
             # An instance routed through an exit node keeps its record: the
             # exit still holds its peer and the admin needs Unlink/Repair.
             if db_proto.get('exit_link'):
+                return True
+            if protocol_base(proto) in AWG_PROTOCOLS and awg_recovery_store().load(server.get('uid'), proto, allow_pending=True):
                 return True
             # Additional AWG-family instances are only known by their saved
             # dynamic keys (awg__2/awg2__2/awg_legacy__2). Keep them unless
@@ -3449,7 +3503,9 @@ def api_check_server(request: Request, server_id: int):
             except Exception as e:
                 return proto, merge_saved_protocol_status(proto, {}, str(e)), str(e)
 
-        protocols_to_check = list(dict.fromkeys(BASE_PROTOCOLS + list(server.get('protocols', {}).keys())))
+        saved_recovery_protocols = awg_recovery_store().protocols(server.get('uid'))
+        protocols_to_check = list(dict.fromkeys(
+            BASE_PROTOCOLS + list(server.get('protocols', {}).keys()) + saved_recovery_protocols))
         # One batched round trip for all AWG containers (ps snapshot + configs
         # + clientsTables) instead of 3-5 SSH commands per instance - this is
         # what made /check take seconds on high-latency servers.
@@ -3505,6 +3561,7 @@ def api_check_server(request: Request, server_id: int):
                         status['protocols'][proto]['container_exists'] = True
                         status['protocols'][proto].setdefault('container_running', False)
                         status['protocols'][proto]['status_preserved'] = True
+                        status['protocols'][proto]['container_missing'] = True
                         link = (server['protocols'][proto] or {}).get('exit_link')
                         if link and not err and not link.get('stale') and result and not result.get('container_exists'):
                             # Container gone but the exit still has our peer
@@ -4504,6 +4561,70 @@ def api_server_config(request: Request, server_id: int, req: ProtocolRequest):
     except Exception as e:
         logger.exception("Error getting server config")
         return JSONResponse({'error': str(e)}, status_code=500)
+
+
+def recovery_target(server_id, protocol):
+    if not PROTOCOL_RE.fullmatch(protocol):
+        raise AwgRecoveryError('Only AWG protocol instances support node recovery')
+    data = load_data()
+    if server_id < 0 or server_id >= len(data['servers']):
+        raise AwgRecoveryError('Server not found')
+    server = data['servers'][server_id]
+    if not server.get('uid'):
+        raise AwgRecoveryError('Server identity is missing')
+    return data, server
+
+
+@app.post('/api/servers/{server_id}/recovery/status', tags=["Protocols"])
+def api_awg_recovery_status(request: Request, server_id: int, req: ProtocolRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _, server = recovery_target(server_id, req.protocol)
+    return state_summary(awg_recovery_store().load(server['uid'], req.protocol, allow_pending=True))
+
+
+@app.post('/api/servers/{server_id}/recovery/capture', tags=["Protocols"])
+async def api_awg_recovery_capture(request: Request, server_id: int, req: ProtocolRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _, server = recovery_target(server_id, req.protocol)
+    ssh = await asyncio.to_thread(get_ssh, server)
+    manager = AWGManager(ssh)
+    ssh._awg_recovery_binding = (awg_recovery_store(), server['uid'])
+    summary = await asyncio.to_thread(manager.capture_recovery_state, req.protocol)
+    return {'status': 'success', 'recovery': summary}
+
+
+@app.post('/api/servers/{server_id}/recovery/restore', tags=["Protocols"])
+async def api_awg_recovery_restore(request: Request, server_id: int, req: ProtocolRequest):
+    if not _check_admin(request):
+        return JSONResponse({'error': 'Forbidden'}, status_code=403)
+    _, server = recovery_target(server_id, req.protocol)
+    state = awg_recovery_store().load(server['uid'], req.protocol)
+    if state is None:
+        return JSONResponse({'error': 'No saved AWG recovery state for this node'}, status_code=409)
+    ssh = await asyncio.to_thread(get_ssh, server)
+    ssh._awg_recovery_binding = (awg_recovery_store(), server['uid'])
+    manager = AWGManager(ssh)
+    result = await asyncio.to_thread(manager.restore_recovery_state, state)
+    # Re-read metadata after the remote operation: do not overwrite concurrent edits.
+    fresh = load_data()
+    sid, current = find_server_by_uid(fresh, server['uid'])
+    if current is None:
+        raise AwgRecoveryError('Node restored but its panel record was removed')
+    record = current.setdefault('protocols', {}).setdefault(req.protocol, {})
+    record.update(installed=True, port=str(state['listen_port']),
+                  awg_params=result.get('awg_params', {}),
+                  base_protocol=protocol_base(req.protocol),
+                  instance=protocol_instance(req.protocol),
+                  container_name=protocol_container_name(req.protocol))
+    record['published_ports'] = sorted({int(h['HostPort']) for hosts in state['port_bindings'].values() for h in hosts})
+    if int(record.get('advertised_port') or 0) not in record['published_ports']:
+        record['advertised_port'] = (state['listen_port'] if state['listen_port'] in record['published_ports']
+                                     else record['published_ports'][0])
+    record['container_running'] = True
+    save_data(fresh)
+    return {'status': 'success', 'recovery': state_summary(awg_recovery_store().load(server['uid'], req.protocol))}
 
 
 @app.post('/api/servers/{server_id}/ssh_cooldown', tags=["Servers"])

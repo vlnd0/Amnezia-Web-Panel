@@ -21,17 +21,29 @@ def serialized_manager(cls):
                     'add_client', 'edit_client', 'toggle_client', 'remove_client',
                     'rename_client', 'set_speed_limit', 'update_awg_settings',
                     'save_client_config', 'save_server_config', 'install_protocol',
-                    'remove_container',
+                    'remove_container', 'restore_recovery_state',
                 }:
                     if '_awg_batch' in vars(self.ssh):
                         self.ssh._awg_batch = None
                     cache = vars(self).get('_server_config_cache')
                     if cache is not None:
                         cache.clear()
-                if method.__name__ in {'install_protocol', 'remove_container'}:
+                if method.__name__ in {'install_protocol', 'remove_container', 'restore_recovery_state'}:
                     if '_docker_ps_cache' in vars(self.ssh):
                         self.ssh._docker_ps_cache = None
-                return method(self, *args, **kwargs)
+                depth = vars(self).get('_operation_depth', 0)
+                before = getattr(type(self), '_recovery_before_operation', None)
+                if before and depth == 0:
+                    before(self, method.__name__, args, kwargs)
+                self._operation_depth = depth + 1
+                try:
+                    result = method(self, *args, **kwargs)
+                finally:
+                    self._operation_depth = depth
+                hook = getattr(type(self), '_recovery_after_operation', None)
+                if hook and depth == 0:
+                    hook(self, method.__name__, args, kwargs, result)
+                return result
 
         return call
 
