@@ -75,10 +75,10 @@ def test_collector_connects_only_target_and_ru_probes_and_checks_each_spare(
         servers, None, 2, ["192.0.2.1", "192.0.2.2", "192.0.2.2"]
     )
 
-    assert set(clients) == {"ru-01", "ru-02", "ch-01"}
+    assert set(clients) == {"ru-01", "ch-01"}
     assert list(result["addresses"]) == ["192.0.2.1", "192.0.2.2"]
     assert result["server_id"] == 2 and result["udp_port"] == 443
-    assert result["probe_sources"] == ["ru-01", "ru-02"]
+    assert result["probe_sources"] == ["ru-01", "check-host"]
     assert probe.call_count == 2
     for call in probe.call_args_list:
         assert call.args[0] is servers[2]
@@ -91,18 +91,18 @@ def test_ru_target_skips_its_own_source(monkeypatch):
     monkeypatch.setattr(health, "_connect", lambda s, f: (NS(disconnect=Mock()), {}))
 
     def probe(target, ssh, sources, target_ip):
-        assert set(sources) == {"ru-02"}
+        assert set(sources) == {"check-host"}
         return {
-            "ru-01": {"status": "unknown"},
-            "ru-02": {"status": "received", "destination_ip": target_ip},
+            name: {"status": "received", "destination_ip": target_ip}
+            for name in health.PROBE_NAMES
         }
 
     monkeypatch.setattr(health, "probe_udp", probe)
 
     result = health.collect_ip_health(_servers(), None, 0, ["192.0.2.1"])
 
-    assert result["probe_sources"] == ["ru-02"]
-    assert set(result["addresses"]["192.0.2.1"]) == {"ru-02"}
+    assert result["probe_sources"] == ["check-host"]
+    assert set(result["addresses"]["192.0.2.1"]) == {"check-host"}
 
 
 def test_missing_or_ambiguous_source_is_unknown(monkeypatch):
