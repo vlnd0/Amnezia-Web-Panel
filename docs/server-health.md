@@ -2,15 +2,27 @@
 
 `GET /api/health/servers` requires the existing admin/support session or Bearer
 token. It returns SSH authentication/command results for the panel inventory
-and UDP/443 delivery from explicitly named `ru-01` and `ru-02` to the other
-servers with an installed AWG protocol in the catalogue.
+and UDP/443 delivery from two sources to the servers with an installed AWG
+protocol in the catalogue (`ru-01` / `ru-02` are domestic and never targets).
+
+Sources, always reported in this order:
+
+- `ru-01` — the inventory node with that name; sends the marker over its SSH.
+- `check-host` — the Moscow nodes of check-host.net, off unless
+  `HEALTH_CHECK_HOST=1`. This sends the probed address to a third party. Its
+  datagrams are empty, so the capture matches them by source address (read
+  from `nodes/hosts`, cached for an hour) and reports `received` only when
+  every node's datagram arrived. A reply naming other senders is `send_failed`.
+
+An unset source is `unknown` / `probe_unavailable`, never a blocked route.
 
 SSH credentials are consumed inside the panel and never included in the
 response. No peer creation, daemon restart, firewall or DNS edits are performed.
 Linux/Python 3 are required remotely. Capture runs as root or through
 noninteractive `sudo -n`. Its socket-local kernel BPF filter admits only UDP
-packets for the probe port with the diagnostic marker prefix; Python then checks
-the full random payload. Normal application traffic is not copied into Python.
+packets for the probe port that carry the diagnostic marker prefix or come from
+a check-host node; Python then checks the full random payload or the source.
+Normal application traffic is not copied into Python.
 This socket filter does not change firewall rules or application delivery. It does not write
 pcap files or return unrelated traffic. All SSH clients/channels are closed.
 
@@ -56,7 +68,7 @@ checks for failed senders, unavailable capture, authorization and caching.
 
 `POST /api/health/servers/{server_id}/ips` accepts
 `{"addresses": ["192.0.2.1", "192.0.2.2"]}` to check the bot's current and spare
-pool addresses with the same RU probes. At most eight literal IPv4 addresses
+pool addresses with the same two sources. At most eight literal IPv4 addresses
 are accepted per call; duplicates are removed. SSH connects to the configured
 target node while senders use the literal addresses, and capture matches the
 exact destination IP. No DNS change is required to test a spare address.

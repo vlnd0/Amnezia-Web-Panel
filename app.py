@@ -3022,7 +3022,7 @@ async def api_server_ip_health(request: Request, server_id: int, body: IpHealthR
 
 @app.get('/api/health/servers', tags=["Servers"])
 async def api_server_health(request: Request):
-    """SSH authentication + UDP/443 delivery from ru-01 and ru-02.
+    """SSH authentication + UDP/443 delivery from ru-01 and check-host.
 
     Uses stored server credentials internally; never returns credentials or
     captured traffic. Results are shared for 30s to bound diagnostic load.

@@ -1,22 +1,31 @@
-"""Read-only SSH and one-way UDP reachability checks from RU probe nodes.
+"""Read-only SSH and one-way UDP reachability checks from two RU vantage points.
 
 No peers, firewall rules or listeners are created. An authenticated SSH command
-checks the host; a short packet socket matches only our random UDP payloads.
+checks the host; a short packet socket matches only our random UDP payloads, or
+empty datagrams from the check-host.net nodes we asked to send them.
 Receipt proves delivery to the destination host, NOT an AWG handshake or tunnel.
 """
 
 import ipaddress
 import json
+import os
 import re
 import secrets
 import shlex
+import socket
 import threading
 import time
+import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import contextmanager
 from datetime import datetime, timezone
 
-PROBE_NAMES = ("ru-01", "ru-02")
+# ru-01 is an inventory node. check-host.net is a third party, so it is opt-in
+# (HEALTH_CHECK_HOST=1).
+PROBE_NAMES = ("ru-01", "check-host")
+# Domestic nodes are never UDP targets, whether or not they still send probes.
+RU_NODES = ("ru-01", "ru-02")
+CHECK_HOST_NODES = ("ru1.node.check-host.net", "ru2.node.check-host.net")
 UDP_PORT = 443
 SSH_TIMEOUT = 5
 CAPTURE_SECONDS = 6
@@ -30,7 +39,9 @@ TOTAL_BUDGET_SECONDS = 120
 RECEIVER = r"""
 import ctypes, json, socket, struct, sys, time
 port, seconds = int(sys.argv[1]), float(sys.argv[2])
-tokens = {arg for arg in sys.argv[3:] if not arg.startswith('--destination-ip=')}
+sources = {arg.split('=', 1)[1] for arg in sys.argv[3:] if arg.startswith('--source-ip=')}
+tokens = {arg for arg in sys.argv[3:] if not arg.startswith('--')}
+tokens |= {'src:' + ip for ip in sources}
 destination_ip = next((arg.split('=', 1)[1] for arg in sys.argv[3:]
                        if arg.startswith('--destination-ip=')), None)
 s = socket.socket(socket.AF_PACKET, socket.SOCK_DGRAM, socket.htons(0x0800))
@@ -39,21 +50,32 @@ class Filter(ctypes.Structure):
                 ("jf", ctypes.c_ubyte), ("k", ctypes.c_uint32)]
 class Program(ctypes.Structure):
     _fields_ = [("len", ctypes.c_ushort), ("filter", ctypes.POINTER(Filter))]
-# IPv4: UDP, unfragmented, requested destination port and payload prefix PVH_.
+# IPv4: UDP, unfragmented, requested destination port, then either a listed
+# source address or the payload prefix PVH_. Sources are tested first: their
+# datagrams are empty, and an out-of-range payload load rejects the packet.
 # Offsets start at the IP header for SOCK_DGRAM; X is the variable IP header size.
-code = (Filter * 11)(
-    Filter(0x30, 0, 0, 9),          # ldb protocol
-    Filter(0x15, 0, 8, 17),         # reject unless UDP
-    Filter(0x28, 0, 0, 6),          # ldh fragmentation flags/offset
-    Filter(0x45, 6, 0, 0x3fff),     # reject fragments
-    Filter(0xb1, 0, 0, 0),          # X = 4 * IPv4 IHL
-    Filter(0x48, 0, 0, 2),          # ldh [X + 2]: UDP destination port
-    Filter(0x15, 0, 3, port),       # reject other ports
-    Filter(0x40, 0, 0, 8),          # ld [X + 8]: first four payload bytes
-    Filter(0x15, 0, 1, 0x5056485f), # reject non-probe payloads
-    Filter(0x06, 0, 0, 128),        # accept only a bounded prefix
-    Filter(0x06, 0, 0, 0),          # reject for this diagnostic socket only
-)
+A, R = "accept", "reject"
+rows = [
+    (0x30, 0, 0, 9),           # ldb protocol
+    (0x15, 0, R, 17),          # reject unless UDP
+    (0x28, 0, 0, 6),           # ldh fragmentation flags/offset
+    (0x45, R, 0, 0x3fff),      # reject fragments
+    (0xb1, 0, 0, 0),           # X = 4 * IPv4 IHL
+    (0x48, 0, 0, 2),           # ldh [X + 2]: UDP destination port
+    (0x15, 0, R, port),        # reject other ports
+    (0x20, 0, 0, 12),          # ld [12]: source address
+] + [
+    (0x15, A, 0, struct.unpack("!I", socket.inet_aton(ip))[0]) for ip in sorted(sources)
+] + [
+    (0x40, 0, 0, 8),           # ld [X + 8]: first four payload bytes
+    (0x15, 0, R, 0x5056485f),  # reject non-probe payloads
+    (0x06, 0, 0, 128),         # accept only a bounded prefix
+    (0x06, 0, 0, 0),           # reject for this diagnostic socket only
+]
+jump = lambda i, to: {A: len(rows) - 2, R: len(rows) - 1}[to] - i - 1 if to else 0
+code = (Filter * len(rows))(*(
+    Filter(op, jump(i, jt), jump(i, jf), k) for i, (op, jt, jf, k) in enumerate(rows)
+))
 program = Program(len(code), code)
 s.setsockopt(socket.SOL_SOCKET, 26, bytes(program))  # Linux SO_ATTACH_FILTER
 s.settimeout(.25)
@@ -77,8 +99,9 @@ while time.monotonic() < end and seen != tokens:
         continue
     size = struct.unpack("!H", p[ihl+4:ihl+6])[0]
     token = p[ihl+8:ihl+size].decode("ascii", errors="ignore")
-    if token in tokens:
-        seen.add(token)
+    for token in (token, 'src:' + socket.inet_ntoa(p[12:16])):
+        if token in tokens:
+            seen.add(token)
 s.close()
 print(json.dumps({"received": sorted(seen)}), flush=True)
 """
@@ -99,7 +122,7 @@ print(json.dumps({"sent": True, "destination_ip": address[0]}), flush=True)
 def probe_name(server):
     """Match explicit RU node names, never assume mutable panel list indices."""
     name = str(server.get("name", "")).lower()
-    for slug in PROBE_NAMES:
+    for slug in RU_NODES:
         if re.search(r"(?<![a-z0-9])" + re.escape(slug) + r"(?![a-z0-9])", name):
             return slug
     return None
@@ -112,6 +135,56 @@ def is_awg_server(server):
         if name.split("__", 1)[0] in ("awg", "awg2", "awg3", "awg_legacy")
         and isinstance(info, dict)
     )
+
+
+def _check_host(path):
+    request = urllib.request.Request(
+        "https://check-host.net/" + path,
+        # The API answers 403 to urllib's default agent.
+        headers={"Accept": "application/json", "User-Agent": "curl/8"},
+    )
+    with urllib.request.urlopen(request, timeout=SSH_TIMEOUT) as response:
+        return json.load(response)
+
+
+_CHECK_HOST_IPS = (0.0, None)
+
+
+def check_host_ips():
+    """Addresses of the Moscow check-host nodes, or None when off/unreachable.
+
+    Their datagrams are empty, so the capture can only match them by source.
+    """
+    global _CHECK_HOST_IPS
+    if os.environ.get("HEALTH_CHECK_HOST") != "1":
+        return None
+    at, ips = _CHECK_HOST_IPS
+    if ips is None or time.monotonic() - at > 3600:
+        try:
+            nodes = _check_host("nodes/hosts")["nodes"]
+            ips = tuple(
+                str(ipaddress.IPv4Address(nodes[name]["ip"]))
+                for name in CHECK_HOST_NODES
+            )
+        except Exception:
+            ips = None
+        _CHECK_HOST_IPS = (time.monotonic(), ips)
+    return ips
+
+
+def _send_check_host(ips, destination):
+    """Ask both nodes for one UDP datagram; refuse a reply naming other senders."""
+    global _CHECK_HOST_IPS
+    reply = _check_host(
+        f"check-udp?host={destination}:{UDP_PORT}"
+        + "".join(f"&node={name}" for name in CHECK_HOST_NODES)
+    )
+    if reply.get("ok") != 1:
+        return {}
+    if {node[3] for node in reply.get("nodes", {}).values()} != set(ips):
+        _CHECK_HOST_IPS = (0.0, None)  # the nodes moved: re-read them next time
+        return {}
+    return {"sent": True, "destination_ip": destination}
 
 
 def _python(script, *args):
@@ -177,7 +250,8 @@ def _connect(server, ssh_factory):
 
 
 def probe_udp(target, target_ssh, sources, *, target_ip=None):
-    """sources: name -> (connected SSHManager or None, per-transport lock).
+    """sources: name -> (handle or None, lock). The handle is a connected
+    SSHManager, or for check-host the addresses its nodes send from.
 
     The receiver's READY marker is read before senders start. A missing probe or
     failed sender/capture is UNKNOWN, never a claim that the route is blocked.
@@ -195,10 +269,14 @@ def probe_udp(target, target_ssh, sources, *, target_ip=None):
             for name in PROBE_NAMES
         }
     tokens = {name: "PVH_" + secrets.token_hex(16) for name in active}
-    destination = [f"--destination-ip={target_ip}"] if target_ip else []
-    command = _python(
-        RECEIVER, UDP_PORT, CAPTURE_SECONDS, *tokens.values(), *destination
-    )
+    expected = {name: [token] for name, token in tokens.items()}
+    filters = [f"--destination-ip={target_ip}"] if target_ip else []
+    if "check-host" in active:
+        ips = active["check-host"][0]
+        expected["check-host"] = ["src:" + ip for ip in ips]
+        filters += [f"--source-ip={ip}" for ip in ips]
+        del tokens["check-host"]
+    command = _python(RECEIVER, UDP_PORT, CAPTURE_SECONDS, *tokens.values(), *filters)
     if target.get("username") != "root":
         command = "sudo -n -- " + command
     stdout = None
@@ -215,14 +293,13 @@ def probe_udp(target, target_ssh, sources, *, target_ip=None):
             def send(name):
                 ssh, lock = active[name]
                 try:
+                    host = target_ip or target["host"]
+                    if name == "check-host":
+                        # Resolved here so the reply can name the probed address.
+                        return name, _send_check_host(ssh, socket.gethostbyname(host))
                     with lock, _ssh_deadline(ssh, SSH_TIMEOUT):
                         out, _, code = ssh.run_command(
-                            _python(
-                                SENDER,
-                                target_ip or target["host"],
-                                UDP_PORT,
-                                tokens[name],
-                            ),
+                            _python(SENDER, host, UDP_PORT, tokens[name]),
                             timeout=SSH_TIMEOUT,
                         )
                     result = json.loads(out) if code == 0 else {}
@@ -230,7 +307,7 @@ def probe_udp(target, target_ssh, sources, *, target_ip=None):
                 except Exception:
                     return name, {}
 
-            with ThreadPoolExecutor(max_workers=2) as pool:
+            with ThreadPoolExecutor(max_workers=len(active)) as pool:
                 sent = dict(pool.map(send, active))
             payload = json.loads(stdout.readline())
             if stdout.channel.recv_exit_status() != 0:
@@ -239,7 +316,7 @@ def probe_udp(target, target_ssh, sources, *, target_ip=None):
             if not isinstance(received, list):
                 raise RuntimeError("capture_invalid")
         for name in active:
-            if tokens[name] in received:
+            if all(token in received for token in expected[name]):
                 results[name] = {"status": "received"}
             elif not sent[name]:
                 results[name] = {"status": "unknown", "reason": "send_failed"}
@@ -271,10 +348,10 @@ def collect_ip_health(servers, ssh_factory, server_id, addresses):
     target = servers[server_id]
     names = [name for name in PROBE_NAMES if probe_name(target) != name]
     source_indices = {}
-    for name in names:
-        matches = [i for i, s in enumerate(servers) if probe_name(s) == name]
+    if "ru-01" in names:
+        matches = [i for i, s in enumerate(servers) if probe_name(s) == "ru-01"]
         if len(matches) == 1:
-            source_indices[name] = matches[0]
+            source_indices["ru-01"] = matches[0]
     indices = list(dict.fromkeys([server_id, *source_indices.values()]))
     connections = {}
     try:
@@ -287,6 +364,7 @@ def collect_ip_health(servers, ssh_factory, server_id, addresses):
             name: (connections.get(source_indices.get(name)), threading.Lock())
             for name in names
         }
+        sources["check-host"] = (check_host_ips(), threading.Lock())
         results = {}
         for ip in addresses:
             if (
@@ -338,14 +416,15 @@ def collect_health(servers, ssh_factory):
                     "awg": is_awg_server(server),
                 }
             )
-        sources = {}
-        for name in PROBE_NAMES:
-            matches = [i for i, s in enumerate(inventory) if probe_name(s) == name]
-            # Ambiguous names must not silently choose a different probe.
-            sources[name] = (
+        matches = [i for i, s in enumerate(inventory) if probe_name(s) == "ru-01"]
+        # Ambiguous names must not silently choose a different probe.
+        sources = {
+            "ru-01": (
                 connections.get(matches[0]) if len(matches) == 1 else None,
                 threading.Lock(),
             )
+        }
+        sources["check-host"] = (check_host_ips(), threading.Lock())
 
         def check_target(index):
             return index, probe_udp(inventory[index], connections[index], sources)

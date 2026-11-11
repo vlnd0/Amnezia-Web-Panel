@@ -151,7 +151,7 @@ def test_receiver_ready_precedes_sending_and_only_matching_token_passes(monkeypa
     )
     assert result["ru-01"]["status"] == "received"
     assert result["ru-01"]["destination_ip"] == "192.0.2.1"
-    assert result["ru-02"]["status"] == "unknown"
+    assert result["check-host"]["status"] == "unknown"
     assert sender.run_command.call_count == 1
 
 
@@ -198,6 +198,8 @@ def test_probe_names_are_explicit_and_not_substring_matches():
     assert health.probe_name({"name": "🇷🇺 pv-ru-01"}) == "ru-01"
     assert health.probe_name({"name": "ru-010"}) is None
     assert health.probe_name({"name": "somewhere", "host": "ru-01.example"}) is None
+    # A retired RU node is still domestic: it must not become a UDP target.
+    assert health.probe_name({"name": "ru-02 WL"}) == "ru-02"
 
 
 def test_ssh_failure_closes_connection_and_hides_error_details():
@@ -217,6 +219,7 @@ def test_collector_checks_sources_but_sends_only_to_other_awg_nodes(monkeypatch)
         return client, {"status": "ok", "ms": 1}
 
     monkeypatch.setattr(health, "_connect", connect)
+    monkeypatch.setattr(health, "check_host_ips", lambda: ("192.0.2.9",))
     probe = Mock(return_value={"ru-01": {"status": "received"}})
     monkeypatch.setattr(health, "probe_udp", probe)
     servers = [
@@ -285,3 +288,68 @@ def test_diagnostic_filter_does_not_intercept_application_datagrams():
             if process.poll() is None:
                 process.kill()
                 process.wait()
+
+
+def test_check_host_is_off_until_enabled(monkeypatch):
+    monkeypatch.delenv("HEALTH_CHECK_HOST", raising=False)
+    assert health.check_host_ips() is None
+
+
+def test_check_host_is_asked_for_the_literal_ip_and_matched_by_source(monkeypatch):
+    asked = []
+    monkeypatch.setattr(
+        health,
+        "_check_host",
+        lambda path: asked.append(path)
+        or {"ok": 1, "nodes": {"a": [0, 0, 0, "192.0.2.8"], "b": [0, 0, 0, "192.0.2.9"]}},
+    )
+    target = target_ssh(
+        [{"ready": True}, {"received": ["src:192.0.2.8", "src:192.0.2.9"]}]
+    )
+    sources = {"check-host": (("192.0.2.8", "192.0.2.9"), threading.Lock())}
+    result = health.probe_udp(
+        {"host": "x", "username": "root"}, target, sources, target_ip="192.0.2.2"
+    )
+    assert asked and asked[0].startswith("check-udp?host=192.0.2.2:443&node=ru1.")
+    capture = target.client.exec_command.call_args.args[0]
+    assert "--source-ip=192.0.2.8" in capture and "--source-ip=192.0.2.9" in capture
+    assert result["check-host"] == {"status": "received", "destination_ip": "192.0.2.2"}
+
+
+def test_check_host_needs_every_node_and_rejects_unexpected_senders(monkeypatch):
+    sources = {"check-host": (("192.0.2.8", "192.0.2.9"), threading.Lock())}
+    target = {"host": "192.0.2.2", "username": "root"}
+    reply = {"ok": 1, "nodes": {"a": [0, 0, 0, "192.0.2.8"], "b": [0, 0, 0, "192.0.2.9"]}}
+    monkeypatch.setattr(health, "_check_host", lambda path: reply)
+    one = target_ssh([{"ready": True}, {"received": ["src:192.0.2.8"]}])
+    assert health.probe_udp(target, one, sources)["check-host"]["status"] == "not_received"
+    reply = {"ok": 1, "nodes": {"a": [0, 0, 0, "198.51.100.1"]}}
+    monkeypatch.setattr(health, "_check_host", lambda path: reply)
+    both = target_ssh([{"ready": True}, {"received": []}])
+    assert health.probe_udp(target, both, sources)["check-host"] == {
+        "status": "unknown",
+        "reason": "send_failed",
+    }
+
+
+def test_real_receiver_matches_empty_datagram_from_listed_source_only():
+    def run(source):
+        process = subprocess.Popen(
+            [sys.executable, "-u", "-c", health.RECEIVER, "443", "1",
+             f"--source-ip={source}"],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            assert json.loads(process.stdout.readline()) == {"ready": True}
+            with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sender:
+                sender.sendto(b"", ("127.0.0.1", 443))
+            output, errors = process.communicate(timeout=4)
+            assert process.returncode == 0, errors
+            return json.loads(output)["received"]
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.wait()
+
+    assert run("127.0.0.1") == ["src:127.0.0.1"]
+    assert run("192.0.2.1") == []
