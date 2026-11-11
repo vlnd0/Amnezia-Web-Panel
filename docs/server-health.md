@@ -15,6 +15,8 @@ Sources, always reported in this order:
   every node's datagram arrived. A reply naming other senders is `send_failed`.
 
 An unset source is `unknown` / `probe_unavailable`, never a blocked route.
+A source that could not send to any target is listed as unavailable in
+`probe_sources`: the fault is the source's, not every node's.
 
 SSH credentials are consumed inside the panel and never included in the
 response. No peer creation, daemon restart, firewall or DNS edits are performed.

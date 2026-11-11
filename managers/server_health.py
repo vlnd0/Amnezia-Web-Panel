@@ -445,13 +445,21 @@ def collect_health(servers, ssh_factory):
                 }
             else:
                 _, rows[index]["udp"] = check_target(index)
+
+        def available(name):
+            # A source that could not send to any target is itself down (a
+            # check-host limit or outage), not a problem of every node.
+            sends = [rows[i].get("udp", {}).get(name, {}) for i in targets]
+            return sources[name][0] is not None and not (
+                sends and all(item.get("reason") == "send_failed" for item in sends)
+            )
+
         return {
             "checked_at": datetime.now(timezone.utc).isoformat(),
             "duration_ms": round((time.monotonic() - started) * 1000),
             "udp_port": UDP_PORT,
             "probe_sources": [
-                {"name": name, "available": sources[name][0] is not None}
-                for name in PROBE_NAMES
+                {"name": name, "available": available(name)} for name in PROBE_NAMES
             ],
             "servers": rows,
             "truncated": len(servers) > MAX_NODES,

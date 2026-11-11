@@ -353,3 +353,40 @@ def test_real_receiver_matches_empty_datagram_from_listed_source_only():
 
     assert run("127.0.0.1") == ["src:127.0.0.1"]
     assert run("192.0.2.1") == []
+
+
+def test_source_that_sent_to_no_target_is_reported_down_once(monkeypatch):
+    monkeypatch.setattr(health, "_connect", lambda s, f: (NS(disconnect=Mock()), {}))
+    monkeypatch.setattr(health, "check_host_ips", lambda: ("192.0.2.9",))
+    monkeypatch.setattr(
+        health,
+        "probe_udp",
+        lambda *a: {
+            "ru-01": {"status": "received"},
+            "check-host": {"status": "unknown", "reason": "send_failed"},
+        },
+    )
+    servers = [
+        {"name": n, "host": "test", "protocols": {"awg2": {"installed": True}}}
+        for n in ("ru-01", "ch-01", "de-01")
+    ]
+    assert health.collect_health(servers, None)["probe_sources"] == [
+        {"name": "ru-01", "available": True},
+        {"name": "check-host", "available": False},
+    ]
+
+
+def test_check_host_nodes_are_read_once_and_a_missing_node_disables_it(monkeypatch):
+    monkeypatch.setenv("HEALTH_CHECK_HOST", "1")
+    monkeypatch.setattr(health, "_CHECK_HOST_IPS", (0.0, None))
+    nodes = {name: {"ip": f"192.0.2.{i}"} for i, name in enumerate(health.CHECK_HOST_NODES)}
+    calls = []
+    monkeypatch.setattr(
+        health, "_check_host", lambda path: calls.append(path) or {"nodes": nodes}
+    )
+    assert health.check_host_ips() == ("192.0.2.0", "192.0.2.1")
+    assert health.check_host_ips() == ("192.0.2.0", "192.0.2.1")
+    assert calls == ["nodes/hosts"]
+    monkeypatch.setattr(health, "_CHECK_HOST_IPS", (0.0, None))
+    del nodes[health.CHECK_HOST_NODES[1]]
+    assert health.check_host_ips() is None
